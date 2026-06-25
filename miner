@@ -1,0 +1,13 @@
+#!/bin/bash
+# Convenience wrapper — run Verathos miner commands from repo root.
+#   ./miner setup
+#   ./miner start
+#   ./miner btcli wallet overview --wallet.name ...
+if [ "${1:-}" = "btcli" ]; then
+    shift
+    exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/btcli.sh" "$@"
+fi
+if [ "${1:-}" = "fix-venv" ]; then
+    exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/fix-miner-venv.sh"
+fi
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/miner-starter.sh" "$@"

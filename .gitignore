@@ -24,6 +24,7 @@ eggs/
 .venv-vllm/
 .venv-vllm-016/
 .venv-vllm-*/
+.venv-btcli/
 venv/
 ENV/
 env/
@@ -59,6 +60,9 @@ zkllm/cuda/build/
 # PM2 ecosystem config (contains wallet names, tokens — user-specific)
 ecosystem.config.js
 !ecosystem.config.example.js
+
+# Local miner starter config (wallet names, endpoint URL)
+miner.conf
 
 # Logs
 *.log
