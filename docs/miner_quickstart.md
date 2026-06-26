@@ -1,8 +1,8 @@
 # Miner Quickstart — L40 VPS (Subnet 96)
 
-Step-by-step guide for running a Verathos miner on a **1× NVIDIA L40 (48 GB)** VPS. Designed for beginners.
+Step-by-step guide for running a Verathos miner on an **NVIDIA L40 (48 GB)** VPS — single GPU or **multi-GPU** (2× L40 on one server). Designed for beginners.
 
-Use the **`./miner`** helper script for an easy setup pipeline.
+Use the **`./miner`** helper script for single-GPU setup. For **2+ GPUs**, see [Multi-GPU setup](#multi-gpu-setup-2-gpus-on-one-server) below.
 
 ---
 
@@ -10,7 +10,7 @@ Use the **`./miner`** helper script for an easy setup pipeline.
 
 | Item | Details |
 |------|---------|
-| **Server** | Linux VPS with 1× L40 (48 GB VRAM), 32 GB+ RAM, 100 GB+ SSD |
+| **Server** | Linux VPS with 1× or 2× L40 (48 GB VRAM each), 32 GB+ RAM per GPU, 100 GB+ SSD |
 | **OS** | Ubuntu 22.04+ |
 | **GPU driver** | `nvidia-smi` must work before you begin |
 | **Network** | Public IP + **inbound HTTPS port** open (443 or custom, e.g. 8443) |
@@ -188,6 +188,125 @@ A healthy miner returns JSON with GPU info and readiness status.
 
 ---
 
+## Multi-GPU setup (2+ GPUs on one server)
+
+If your VPS has **2 or more GPUs** (e.g. 2× L40), run **one miner process per GPU**. Each process serves one model on one GPU and registers its own public endpoint. **One Bittensor UID** (same wallet + hotkey) can register **multiple endpoints** — validators dedupe by GPU UUID, so each physical GPU counts separately.
+
+> **Do not** run two miners on the same GPU without `CUDA_VISIBLE_DEVICES` — both will try GPU 0 and OOM.
+
+### Architecture (2× GPU)
+
+```
+Your VPS (2× L40)
+├── miner (PM2)     → CUDA_VISIBLE_DEVICES=0 → vLLM :8000 → public :443  (or :40000)
+├── miner-1 (PM2)   → CUDA_VISIBLE_DEVICES=1 → vLLM :8001 → public :8443 (or :40001)
+└── miner.conf      → first miner only (wallet, network, primary endpoint)
+    ecosystem.config.js → both PM2 processes (edit this for multi-GPU)
+```
+
+| File | Role |
+|------|------|
+| `miner.conf` | First miner: wallet, network, primary endpoint, model |
+| `ecosystem.config.js` | One PM2 app per GPU (`miner`, `miner-1`, …) |
+| `.env.sh` | `LD_LIBRARY_PATH` for vLLM CUDA libs (created by `setup_miner.sh`) |
+
+### Option A — Wizard (recommended)
+
+1. Complete [Steps 0–7](#step-0--verify-gpu-on-the-vps) for the **first GPU** (`./miner setup` then `./miner start`).
+2. Re-run the wizard and add a second endpoint:
+
+```bash
+verathos setup
+# Choose: [3] Add model endpoint (different model/GPU/port)
+```
+
+The wizard auto-assigns `CUDA_VISIBLE_DEVICES`, internal vLLM port (`8001`, …), external HTTPS port, and PM2 name (`miner-1`, …).
+
+### Option B — Manual `ecosystem.config.js`
+
+After `./miner setup` for GPU 0, create or edit `ecosystem.config.js` in the repo root. Example for **2× L40** with ports `40000` and `40001`:
+
+```javascript
+// Generate LD_LIBRARY_PATH once (vLLM 0.20.x needs pip CUDA 13 libs):
+//   source .env.sh   # or run: bash scripts/setup_miner.sh
+const LD_LIBRARY_PATH = process.env.LD_LIBRARY_PATH || "<paste from .env.sh>";
+
+const baseEnv = {
+  LD_LIBRARY_PATH,
+  VLLM_ENABLE_V1_MULTIPROCESSING: "0",
+};
+
+module.exports = {
+  apps: [
+    {
+      name: "miner",
+      script: ".venv-vllm/bin/python",
+      args: "-u -m neurons.miner --wallet <WALLET> --hotkey <HOTKEY> --netuid 96 --subtensor-network finney --model-id auto --endpoint https://YOUR_IP:40000 --port 8000 --auto-update",
+      cwd: "/path/to/verathos",
+      env: { ...baseEnv, CUDA_VISIBLE_DEVICES: "0" },
+      autorestart: false,
+      max_restarts: 0,
+      merge_logs: true,
+    },
+    {
+      name: "miner-1",
+      script: ".venv-vllm/bin/python",
+      args: "-u -m neurons.miner --wallet <WALLET> --hotkey <HOTKEY> --netuid 96 --subtensor-network finney --model-id auto --endpoint https://YOUR_IP:40001 --port 8001 --auto-update",
+      cwd: "/path/to/verathos",
+      env: { ...baseEnv, CUDA_VISIBLE_DEVICES: "1" },
+      autorestart: false,
+      max_restarts: 0,
+      merge_logs: true,
+    },
+  ],
+};
+```
+
+**Firewall / port mapping** — open **both** external ports (UFW + cloud panel). If your host maps `40000 → 8000`, add `40001 → 8001` the same way.
+
+**HTTPS for the second miner** (if using nginx):
+
+```bash
+sudo bash scripts/setup_https.sh --port 40001 --backend-port 8001 --append
+```
+
+### Start and monitor (multi-GPU)
+
+```bash
+# Start both miners (NOT ./miner start — that overwrites ecosystem.config.js)
+pm2 start ecosystem.config.js
+pm2 save
+
+# Or one at a time:
+pm2 start ecosystem.config.js --only miner
+pm2 start ecosystem.config.js --only miner-1
+
+pm2 list
+pm2 logs miner --lines 50
+pm2 logs miner-1 --lines 50
+```
+
+**Health checks:**
+
+```bash
+curl -s http://localhost:8000/health   # GPU 0 (internal)
+curl -s http://localhost:8001/health   # GPU 1 (internal)
+```
+
+### Multi-GPU daily commands
+
+| Task | Command |
+|------|---------|
+| Start all miners | `pm2 start ecosystem.config.js` |
+| Stop all | `pm2 stop all` |
+| Logs (GPU 0) | `pm2 logs miner --lines 50` |
+| Logs (GPU 1) | `pm2 logs miner-1 --lines 50` |
+| Status | `pm2 list` |
+
+Avoid `./miner start` and `./miner configure` on multi-GPU hosts — they regenerate a **single-miner** `ecosystem.config.js` from `miner.conf`.
+
+---
+
 ## Daily commands cheat sheet
 
 | Task | Command |
@@ -209,8 +328,10 @@ A healthy miner returns JSON with GPU info and readiness status.
 |-------|--------|
 | **VRAM tier** | 48 GB → `GB_48` — larger models than 24 GB cards |
 | **Model** | Use `MODEL_ID="auto"` in `miner.conf` (default) |
-| **One GPU** | One miner process, one model, one endpoint |
+| **One GPU** | One miner process, one model, one endpoint — use `./miner start` |
+| **Two GPUs** | Two PM2 processes in `ecosystem.config.js` — use `pm2 start ecosystem.config.js` |
 | **HTTPS port** | If 443 is taken, use `./miner https` with `--port 8443` and set endpoint to `https://IP:8443` |
+| **Multi-GPU ports** | Each GPU needs a unique external port **and** internal `--port` (8000, 8001, …) |
 
 ---
 
@@ -256,6 +377,34 @@ The starter installs PM2 automatically. Or manually:
 ```bash
 sudo npm install -g pm2
 ```
+
+### `libcudart.so.13: cannot open shared object file`
+
+vLLM 0.20.x ships CUDA 13 runtime libs inside the venv (`site-packages/nvidia/cu13/lib/`). PM2 does not set `LD_LIBRARY_PATH` by default.
+
+**Fix:**
+
+1. Ensure `.env.sh` exists (created by `bash scripts/setup_miner.sh`):
+
+```bash
+source .env.sh
+.venv-vllm/bin/python -c "import vllm._C; print('CUDA libs OK')"
+```
+
+2. Add `LD_LIBRARY_PATH` from `.env.sh` to each app's `env` block in `ecosystem.config.js` (see [Multi-GPU setup](#multi-gpu-setup-2-gpus-on-one-server)).
+
+3. Restart: `pm2 delete all && pm2 start ecosystem.config.js && pm2 save`
+
+### Only one miner started (multi-GPU)
+
+- Check `ecosystem.config.js` has **two** apps (`miner` and `miner-1`). `./miner start` overwrites it with a single entry — restore from backup or re-create the dual-GPU config.
+- Run `pm2 start ecosystem.config.js` (starts all apps), not `pm2 start ecosystem.config.js --only miner`.
+
+### Second GPU endpoint unreachable
+
+- Open the second external port in UFW and your cloud firewall (e.g. `40001`).
+- Map external port → internal vLLM port (`40001 → 8001`) if your provider uses port forwarding.
+- Confirm health: `curl -s http://localhost:8001/health`
 
 ---
 
