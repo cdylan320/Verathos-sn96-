@@ -196,3 +196,130 @@ miner_prompt_yesno() {
         *) return 1 ;;
     esac
 }
+
+# Return PM2 log text for the miner process (empty if unavailable).
+miner_pm2_log_text() {
+    local pm2_name="$1"
+    local lines="${2:-500}"
+    if ! command -v pm2 &>/dev/null; then
+        return 1
+    fi
+    pm2 logs "$pm2_name" --nostream --lines "$lines" 2>/dev/null
+}
+
+# Scan miner logs for capacity-audit worker state.
+miner_check_capacity_audit_worker_logs() {
+    local pm2_name="$1"
+    local log_text=""
+
+    if ! command -v pm2 &>/dev/null; then
+        miner_warn "PM2 not installed — cannot inspect capacity-audit worker logs"
+        return 2
+    fi
+    if ! pm2 describe "$pm2_name" &>/dev/null; then
+        miner_fail "Miner process '$pm2_name' is not running"
+        miner_info "Start first: ./miner start"
+        return 1
+    fi
+    miner_ok "PM2 process '$pm2_name' is running"
+
+    log_text="$(miner_pm2_log_text "$pm2_name" 800 || true)"
+    if [ -z "$log_text" ]; then
+        miner_warn "Could not read PM2 logs for '$pm2_name'"
+        return 2
+    fi
+
+    if echo "$log_text" | grep -qiE "Capacity audit miner worker disabled|hot-capacity workspace extension unavailable"; then
+        miner_fail "Capacity-audit worker disabled in miner logs"
+        echo "$log_text" | grep -iE "Capacity audit miner worker disabled|hot-capacity workspace extension unavailable" | tail -3 | while read -r line; do
+            miner_info "$line"
+        done
+        miner_info "Fix: bash scripts/setup_miner.sh && ./miner restart"
+        return 1
+    fi
+
+    if echo "$log_text" | grep -q "Capacity audit miner worker started"; then
+        worker_line="$(echo "$log_text" | grep "Capacity audit miner worker started" | tail -1)"
+        miner_ok "Capacity-audit worker started"
+        miner_info "$(echo "$worker_line" | sed 's/^[[:space:]]*//')"
+    else
+        miner_fail "No 'Capacity audit miner worker started' line in recent logs"
+        miner_info "Miner may be on old code or still booting — wait 2 min and re-run ./miner check-audit"
+        return 1
+    fi
+
+    if echo "$log_text" | grep -q "Capacity audit publish has no validator endpoints"; then
+        miner_fail "Miner logs show no validator audit ingest endpoints"
+        return 1
+    fi
+
+    if echo "$log_text" | grep -q "Capacity audit publish error"; then
+        miner_warn "Recent capacity-audit publish transport errors in logs"
+        echo "$log_text" | grep "Capacity audit publish error" | tail -3 | while read -r line; do
+            miner_info "$line"
+        done
+        miner_info "Check outbound firewall to validator ingest ports (usually :8091)"
+        return 2
+    fi
+
+    if echo "$log_text" | grep -q "Capacity audit artifacts published"; then
+        publish_line="$(echo "$log_text" | grep "Capacity audit artifacts published" | tail -1)"
+        miner_ok "Recent successful audit receipt publish seen in logs"
+        miner_info "$(echo "$publish_line" | sed 's/^[[:space:]]*//')"
+    else
+        miner_warn "No successful audit publish yet (normal if no audit window since restart)"
+    fi
+
+    return 0
+}
+
+# Run Python preflight for wheel, GPU calibration, and validator ingest reachability.
+miner_check_capacity_audit_runtime() {
+    local repo="$1"
+    local network="$2"
+    local netuid="$3"
+    local python="$repo/.venv-vllm/bin/python"
+    local script="$repo/scripts/check_capacity_audit_miner.py"
+    local output line rc=0 py_rc=0
+
+    if [ ! -x "$python" ]; then
+        miner_fail "Python venv missing — run: ./miner install"
+        return 1
+    fi
+    if [ ! -f "$script" ]; then
+        miner_fail "Missing audit check script: $script"
+        return 1
+    fi
+
+    output="$("$python" "$script" --subtensor-network "$network" --netuid "$netuid" 2>&1)" || py_rc=$?
+
+    while IFS= read -r line; do
+        case "$line" in
+            OK:*)
+                miner_ok "${line#OK: }"
+                ;;
+            WARN:*)
+                miner_warn "${line#WARN: }"
+                rc=2
+                ;;
+            FAIL:*)
+                miner_fail "${line#FAIL: }"
+                rc=1
+                ;;
+            \ \ -*)
+                miner_info "$line"
+                ;;
+            *)
+                [ -n "$line" ] && miner_info "$line"
+                ;;
+        esac
+    done <<< "$output"
+
+    if [ "$py_rc" -ne 0 ]; then
+        return 1
+    fi
+    if [ "$rc" -eq 2 ]; then
+        return 2
+    fi
+    return 0
+}

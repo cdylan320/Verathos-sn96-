@@ -7,6 +7,7 @@
 #   ./miner setup        # First time: install + configure + HTTPS (guided)
 #   ./miner configure    # Edit wallet, endpoint, model settings
 #   ./miner check        # Preflight before starting
+#   ./miner check-audit  # Hot-capacity audit preflight (wheel, worker, ingest)
 #   ./miner start        # Start miner (PM2)
 #   ./miner stop         # Stop miner
 #   ./miner status       # GPU, wallet, PM2, endpoint health
@@ -224,9 +225,80 @@ cmd_check() {
     echo ""
     if $ok; then
         echo -e "${_C_GREEN}${_C_BOLD}  Ready to start!  Run:  ./miner start${_C_RESET}"
+        echo -e "${_C_DIM}  After start, verify hot-capacity audits:  ./miner check-audit${_C_RESET}"
     else
         echo -e "${_C_YELLOW}${_C_BOLD}  Fix the issues above, then run:  ./miner check${_C_RESET}"
         exit 1
+    fi
+    echo ""
+}
+
+# ── check-audit: hot-capacity audit preflight ────────────────────────────────
+cmd_check_audit() {
+    local from_setup=false
+    if [ "${1:-}" = "--from-setup" ]; then
+        from_setup=true
+    fi
+
+    if [ "$from_setup" = false ]; then
+        miner_banner
+    fi
+    miner_step "Hot-capacity audit preflight"
+    echo ""
+    miner_info "Checks wheel install, GPU calibration, miner worker logs, and"
+    miner_info "outbound reachability to validator audit ingest endpoints."
+    echo ""
+
+    local ok=true
+    local rc=0
+
+    if [ -f "$REPO_ROOT/miner.conf" ]; then
+        miner_load_config "$REPO_ROOT"
+    else
+        NETWORK="${NETWORK:-finney}"
+        NETUID="${NETUID:-96}"
+        PM2_NAME="${PM2_NAME:-miner}"
+        miner_warn "miner.conf missing — using defaults (network=$NETWORK netuid=$NETUID)"
+    fi
+
+    miner_source_env "$REPO_ROOT"
+    echo ""
+
+    miner_step "1/3 Runtime (wheel, GPU, validator ingest reachability)"
+    if ! miner_check_capacity_audit_runtime "$REPO_ROOT" "$NETWORK" "$NETUID"; then
+        ok=false
+    fi
+    echo ""
+
+    miner_step "2/3 Miner process + capacity-audit worker logs"
+    set +e
+    miner_check_capacity_audit_worker_logs "$PM2_NAME"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 1 ]; then
+        ok=false
+    fi
+    echo ""
+
+    miner_step "3/3 Quick fixes if audits still fail"
+    echo "  • Reinstall audit wheel:  bash scripts/setup_miner.sh"
+    echo "  • Full restart:            ./miner restart"
+    echo "  • Tail audit logs:         ./miner logs 200 | grep -i capacity"
+    echo "  • Manual validator URLs:   export VERATHOS_CAPACITY_AUDIT_VALIDATOR_URLS=http://HOST:8091"
+    echo ""
+
+    if $ok && [ "$rc" -ne 1 ]; then
+        echo -e "${_C_GREEN}${_C_BOLD}  Capacity-audit preflight passed.${_C_RESET}"
+        if [ "$rc" -eq 2 ]; then
+            echo -e "${_C_YELLOW}  Review warnings above — publish errors may still cause no_show.${_C_RESET}"
+        fi
+    else
+        echo -e "${_C_YELLOW}${_C_BOLD}  Capacity-audit issues found — fix above before the next audit window.${_C_RESET}"
+        echo -e "${_C_DIM}  Missing receipts → validator records no_show / missing_final_receipt.${_C_RESET}"
+        if [ "$from_setup" = false ]; then
+            exit 1
+        fi
+        return 1
     fi
     echo ""
 }
@@ -268,6 +340,7 @@ cmd_start() {
         miner_ok "Miner started via PM2 (process: $PM2_NAME)"
         miner_info "Logs:   ./miner logs"
         miner_info "Status: ./miner status"
+        miner_info "Audit:  ./miner check-audit"
         miner_info "Stop:   ./miner stop"
     else
         miner_warn "Starting in foreground (Ctrl+C to stop)"
@@ -353,7 +426,7 @@ cmd_models() {
 cmd_setup() {
     miner_banner
     echo "  Welcome! This wizard will:"
-    echo "    1. Install dependencies (GPU drivers must already work: nvidia-smi)"
+    echo "    1. Install / update dependencies (incl. hot-capacity audit wheel)"
     echo "    2. Configure wallet, network, and endpoint"
     echo "    3. Set up HTTPS reverse proxy"
     echo "    4. Run preflight checks"
@@ -363,12 +436,10 @@ cmd_setup() {
     fi
 
     echo ""
-    if [ ! -f "$REPO_ROOT/.venv-vllm/bin/python" ]; then
-        cmd_install
-    else
-        miner_ok "Environment already installed (.venv-vllm exists)"
-        miner_source_env "$REPO_ROOT"
+    if [ -f "$REPO_ROOT/.venv-vllm/bin/python" ]; then
+        miner_info "Existing .venv-vllm found — re-running install to pick up updates"
     fi
+    cmd_install
 
     echo ""
     cmd_configure
@@ -393,6 +464,9 @@ cmd_setup() {
     cmd_check || true
 
     echo ""
+    cmd_check_audit --from-setup || true
+
+    echo ""
     if miner_prompt_yesno "Start miner now?" "n"; then
         cmd_start
     else
@@ -415,6 +489,7 @@ cmd_help() {
     configure   Interactive wallet / endpoint / model settings
     https       Setup nginx HTTPS reverse proxy (self-signed cert)
     check       Preflight: GPU, wallet, venv, endpoint
+    check-audit Hot-capacity audit: wheel, worker logs, validator ingest
     start       Start miner (PM2 background)
     stop        Stop miner
     status      Show GPU + PM2 status
@@ -442,6 +517,7 @@ case "$CMD" in
     configure)  cmd_configure "$@" ;;
     https)      cmd_https "$@" ;;
     check)      cmd_check "$@" ;;
+    check-audit) cmd_check_audit "$@" ;;
     start)      cmd_start "$@" ;;
     stop)       cmd_stop "$@" ;;
     restart)    cmd_stop; cmd_start "$@" ;;
