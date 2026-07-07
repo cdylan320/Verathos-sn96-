@@ -25,3 +25,7 @@ MODEL_ID="auto"
 # Process manager
 PM2_NAME="miner"
 USE_PM2=true
+
+# Hugging Face token (optional) — higher download rate limits
+# Get one at https://huggingface.co/settings/tokens
+# export HF_TOKEN="hf_..."

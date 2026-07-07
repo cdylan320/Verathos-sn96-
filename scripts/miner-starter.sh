@@ -34,6 +34,10 @@ cmd_install() {
     miner_banner
     miner_step "Step 1/1 — Installing Verathos miner environment (15–30 min first run)"
     echo ""
+    if [ -f "$REPO_ROOT/miner.conf" ]; then
+        # shellcheck source=/dev/null
+        source "$REPO_ROOT/miner.conf"
+    fi
     bash "$REPO_ROOT/scripts/setup_miner.sh" "$@"
     miner_source_env "$REPO_ROOT"
     echo ""
@@ -47,7 +51,7 @@ cmd_configure() {
     echo ""
 
     local conf="$REPO_ROOT/miner.conf"
-    local wallet hotkey network netuid endpoint https_port model_id use_pm2 public_ip
+    local wallet hotkey network netuid endpoint https_port model_id use_pm2 public_ip hf_token
 
     # Load existing defaults
     if [ -f "$conf" ]; then
@@ -61,6 +65,7 @@ cmd_configure() {
         https_port="${HTTPS_PORT:-443}"
         model_id="${MODEL_ID:-auto}"
         use_pm2="${USE_PM2:-true}"
+        hf_token="${HF_TOKEN:-}"
     else
         wallet="miner"
         hotkey="default"
@@ -70,6 +75,7 @@ cmd_configure() {
         model_id="auto"
         use_pm2="true"
         endpoint=""
+        hf_token=""
     fi
 
     public_ip="$(miner_detect_public_ip)"
@@ -105,10 +111,18 @@ cmd_configure() {
     miner_prompt model_id "Model ID (auto = best for your GPU)" "$model_id"
 
     echo ""
+    miner_prompt hf_token "HF token (optional — huggingface.co/settings/tokens)" "$hf_token"
+
+    echo ""
     if miner_prompt_yesno "Use PM2 to keep miner running in background?" "y"; then
         use_pm2="true"
     else
         use_pm2="false"
+    fi
+
+    local hf_token_block=""
+    if [ -n "$hf_token" ]; then
+        hf_token_block=$'\n\n# Hugging Face token — higher download rate limits\nexport HF_TOKEN="'"$hf_token"'"'
     fi
 
     cat > "$conf" <<EOF
@@ -122,7 +136,7 @@ HTTPS_PORT=$https_port
 BACKEND_PORT=8000
 MODEL_ID="$model_id"
 PM2_NAME="miner"
-USE_PM2=$use_pm2
+USE_PM2=$use_pm2${hf_token_block}
 EOF
 
     miner_ok "Saved $conf"
@@ -320,6 +334,8 @@ cmd_start() {
     miner_info "Endpoint: $ENDPOINT"
     miner_info "Model:    $MODEL_ID"
     echo ""
+
+    miner_prefetch_hf_model "$REPO_ROOT"
 
     if [ "$USE_PM2" = "true" ]; then
         if ! command -v pm2 &>/dev/null; then
