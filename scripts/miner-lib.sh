@@ -246,13 +246,19 @@ const path = require("path");
 const REPO = __dirname;
 const envSh = fs.readFileSync(path.join(REPO, ".env.sh"), "utf8");
 const ldMatch = envSh.match(/^export LD_LIBRARY_PATH="([^"]*)"/m);
+const hfHomeMatch = envSh.match(/^export HF_HOME="([^"]*)"/m);
 const LD_LIBRARY_PATH =
   process.env.LD_LIBRARY_PATH || (ldMatch && ldMatch[1]) || "";
+const HF_HOME =
+  process.env.HF_HOME || (hfHomeMatch && hfHomeMatch[1]) || "";
 
 const baseEnv = {
   LD_LIBRARY_PATH,
   VLLM_ENABLE_V1_MULTIPROCESSING: "0",
 };
+if (HF_HOME) {
+  baseEnv.HF_HOME = HF_HOME;
+}
 
 module.exports = {
   apps: [${apps_block}
