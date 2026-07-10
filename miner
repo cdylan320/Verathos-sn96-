@@ -1,7 +1,9 @@
 #!/bin/bash
 # Convenience wrapper — run Verathos miner commands from repo root.
 #   ./miner setup
-#   ./miner start
+#   ./miner start          # single GPU, or all GPUs when MULTI_GPU=true
+#   ./miner prefetch       # download full HuggingFace snapshot (run before first start)
+#   ./miner https          # nginx for one or all GPUs (see miner.conf MULTI_GPU)
 #   ./miner btcli wallet overview --wallet.name ...
 if [ "${1:-}" = "btcli" ]; then
     shift

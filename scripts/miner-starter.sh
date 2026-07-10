@@ -51,7 +51,7 @@ cmd_configure() {
     echo ""
 
     local conf="$REPO_ROOT/miner.conf"
-    local wallet hotkey network netuid endpoint https_port model_id use_pm2 public_ip hf_token
+    local wallet hotkey network netuid endpoint https_port model_id use_pm2 public_ip hf_token multi_gpu gpu_count public_ip_cfg
 
     # Load existing defaults
     if [ -f "$conf" ]; then
@@ -66,6 +66,9 @@ cmd_configure() {
         model_id="${MODEL_ID:-auto}"
         use_pm2="${USE_PM2:-true}"
         hf_token="${HF_TOKEN:-}"
+        multi_gpu="${MULTI_GPU:-false}"
+        gpu_count="${GPU_COUNT:-1}"
+        public_ip_cfg="${PUBLIC_IP:-}"
     else
         wallet="miner"
         hotkey="default"
@@ -76,6 +79,9 @@ cmd_configure() {
         use_pm2="true"
         endpoint=""
         hf_token=""
+        multi_gpu="false"
+        gpu_count=1
+        public_ip_cfg=""
     fi
 
     public_ip="$(miner_detect_public_ip)"
@@ -111,6 +117,28 @@ cmd_configure() {
     miner_prompt model_id "Model ID (auto = best for your GPU)" "$model_id"
 
     echo ""
+    local multi_gpu="${MULTI_GPU:-false}"
+    local gpu_count="${GPU_COUNT:-1}"
+    local public_ip_cfg="${PUBLIC_IP:-}"
+    if miner_prompt_yesno "Run one miner per GPU (multi-GPU setup)?" "$([ "$multi_gpu" = true ] && echo y || echo n)"; then
+        multi_gpu="true"
+        local detected_gpus
+        detected_gpus="$(miner_count_gpus)"
+        miner_prompt gpu_count "Number of GPUs to use" "${gpu_count:-$detected_gpus}"
+        if [ -z "$public_ip_cfg" ] || [ "$public_ip_cfg" = "YOUR_PUBLIC_IP" ]; then
+            public_ip_cfg="${public_ip:-YOUR_PUBLIC_IP}"
+        fi
+        miner_prompt public_ip_cfg "Public IP (validators connect here)" "$public_ip_cfg"
+        if [ "$https_port" = "443" ] && [ "$multi_gpu" = "true" ]; then
+            https_port=40000
+            miner_info "Multi-GPU default HTTPS base port set to 40000 (GPU N uses 40000+N)"
+        fi
+    else
+        multi_gpu="false"
+        gpu_count=1
+    fi
+
+    echo ""
     miner_prompt hf_token "HF token (optional — huggingface.co/settings/tokens)" "$hf_token"
 
     echo ""
@@ -125,6 +153,11 @@ cmd_configure() {
         hf_token_block=$'\n\n# Hugging Face token — higher download rate limits\nexport HF_TOKEN="'"$hf_token"'"'
     fi
 
+    local multi_gpu_block=""
+    if [ "$multi_gpu" = "true" ]; then
+        multi_gpu_block=$'\nMULTI_GPU=true\nGPU_COUNT='"$gpu_count"$'\nPUBLIC_IP="'"$public_ip_cfg"'"'
+    fi
+
     cat > "$conf" <<EOF
 # Verathos Miner Configuration — generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
 WALLET_NAME="$wallet"
@@ -136,7 +169,7 @@ HTTPS_PORT=$https_port
 BACKEND_PORT=8000
 MODEL_ID="$model_id"
 PM2_NAME="miner"
-USE_PM2=$use_pm2${hf_token_block}
+USE_PM2=$use_pm2${multi_gpu_block}${hf_token_block}
 EOF
 
     miner_ok "Saved $conf"
@@ -160,6 +193,12 @@ cmd_https() {
     else
         HTTPS_PORT=443
         BACKEND_PORT=8000
+        MULTI_GPU=false
+        GPU_COUNT=1
+    fi
+    if miner_is_multi_gpu; then
+        miner_setup_https_all "$REPO_ROOT"
+        return 0
     fi
     miner_step "Setting up HTTPS reverse proxy (port $HTTPS_PORT → localhost:$BACKEND_PORT)"
     echo ""
@@ -333,6 +372,9 @@ cmd_start() {
     miner_step "Starting Verathos miner"
     miner_info "Endpoint: $ENDPOINT"
     miner_info "Model:    $MODEL_ID"
+    if miner_is_multi_gpu; then
+        miner_info "Multi-GPU: ${GPU_COUNT:-$(miner_count_gpus)} processes (ecosystem.config.js)"
+    fi
     echo ""
 
     miner_prefetch_hf_model "$REPO_ROOT"
@@ -342,22 +384,35 @@ cmd_start() {
             miner_step "Installing PM2..."
             npm install -g pm2 2>/dev/null || sudo npm install -g pm2
         fi
-        [ -f "$REPO_ROOT/ecosystem.config.js" ] || miner_generate_ecosystem "$REPO_ROOT"
-        # Always regenerate PM2 config from miner.conf so wallet/endpoint stay in sync.
         miner_generate_ecosystem "$REPO_ROOT"
         cd "$REPO_ROOT"
-        if pm2 describe "$PM2_NAME" &>/dev/null; then
+        if miner_is_multi_gpu; then
+            pm2 start ecosystem.config.js
+            pm2 save 2>/dev/null || true
+            echo ""
+            miner_ok "Started ${GPU_COUNT:-$(miner_count_gpus)} miners via PM2 (ecosystem.config.js)"
+            miner_info "Logs:   ./miner logs"
+            miner_info "Status: ./miner status"
+            miner_info "Stop:   ./miner stop"
+        elif pm2 describe "$PM2_NAME" &>/dev/null; then
             pm2 restart "$PM2_NAME"
+            pm2 save 2>/dev/null || true
+            echo ""
+            miner_ok "Miner started via PM2 (process: $PM2_NAME)"
+            miner_info "Logs:   ./miner logs"
+            miner_info "Status: ./miner status"
+            miner_info "Audit:  ./miner check-audit"
+            miner_info "Stop:   ./miner stop"
         else
             pm2 start ecosystem.config.js --only "$PM2_NAME"
+            pm2 save 2>/dev/null || true
+            echo ""
+            miner_ok "Miner started via PM2 (process: $PM2_NAME)"
+            miner_info "Logs:   ./miner logs"
+            miner_info "Status: ./miner status"
+            miner_info "Audit:  ./miner check-audit"
+            miner_info "Stop:   ./miner stop"
         fi
-        pm2 save 2>/dev/null || true
-        echo ""
-        miner_ok "Miner started via PM2 (process: $PM2_NAME)"
-        miner_info "Logs:   ./miner logs"
-        miner_info "Status: ./miner status"
-        miner_info "Audit:  ./miner check-audit"
-        miner_info "Stop:   ./miner stop"
     else
         miner_warn "Starting in foreground (Ctrl+C to stop)"
         cd "$REPO_ROOT"
@@ -371,7 +426,16 @@ cmd_start() {
 
 cmd_stop() {
     miner_load_config "$REPO_ROOT" 2>/dev/null || PM2_NAME="miner"
-    if command -v pm2 &>/dev/null && pm2 describe "$PM2_NAME" &>/dev/null; then
+    if ! command -v pm2 &>/dev/null; then
+        miner_warn "PM2 not installed"
+        return 0
+    fi
+    if miner_is_multi_gpu && [ -f "$REPO_ROOT/ecosystem.config.js" ]; then
+        pm2 stop ecosystem.config.js 2>/dev/null || true
+        miner_ok "Stopped all miners in ecosystem.config.js"
+        return 0
+    fi
+    if pm2 describe "$PM2_NAME" &>/dev/null; then
         pm2 stop "$PM2_NAME"
         miner_ok "Stopped $PM2_NAME"
     else
@@ -388,7 +452,12 @@ cmd_status() {
     if [ -f "$REPO_ROOT/miner.conf" ]; then
         miner_load_config "$REPO_ROOT"
         miner_check_wallet "$WALLET_NAME" "$HOTKEY_NAME" || true
-        miner_info "Endpoint: $ENDPOINT | Network: $NETWORK | Model: $MODEL_ID"
+        if miner_is_multi_gpu; then
+            miner_info "Multi-GPU: ${GPU_COUNT:-$(miner_count_gpus)} miners | Network: $NETWORK | Model: $MODEL_ID"
+            miner_info "Primary endpoint: $ENDPOINT | Ports: ${HTTPS_PORT:-40000}–$((HTTPS_PORT + GPU_COUNT - 1))"
+        else
+            miner_info "Endpoint: $ENDPOINT | Network: $NETWORK | Model: $MODEL_ID"
+        fi
     fi
     echo ""
 
@@ -404,10 +473,13 @@ cmd_status() {
 cmd_logs() {
     miner_load_config "$REPO_ROOT" 2>/dev/null || PM2_NAME="miner"
     local lines="${1:-80}"
-    if command -v pm2 &>/dev/null; then
-        pm2 logs "$PM2_NAME" --lines "$lines"
-    else
+    if ! command -v pm2 &>/dev/null; then
         miner_die "PM2 not installed — start miner with USE_PM2=true"
+    fi
+    if miner_is_multi_gpu; then
+        pm2 logs --lines "$lines"
+    else
+        pm2 logs "$PM2_NAME" --lines "$lines"
     fi
 }
 
@@ -504,6 +576,7 @@ cmd_help() {
     install     Install Python deps, vLLM, CUDA extensions only
     configure   Interactive wallet / endpoint / model settings
     https       Setup nginx HTTPS reverse proxy (self-signed cert)
+    prefetch    Download full HuggingFace model snapshot (fixes IncompleteSnapshotError)
     check       Preflight: GPU, wallet, venv, endpoint
     check-audit Hot-capacity audit: wheel, worker logs, validator ingest
     start       Start miner (PM2 background)
@@ -523,7 +596,21 @@ cmd_help() {
 
   Full guide:  docs/miner_quickstart.md
 
+  Multi-GPU (one miner per GPU):
+
+    Set MULTI_GPU=true and GPU_COUNT in miner.conf, then:
+    ./miner https      # nginx for all GPUs (40000→8000, 40001→8001, …)
+    ./miner prefetch   # download full HF snapshot once
+    ./miner start      # prefetch + pm2 start ecosystem.config.js
+
 HELP
+}
+
+cmd_prefetch() {
+    miner_banner
+    miner_load_config "$REPO_ROOT"
+    miner_source_env "$REPO_ROOT"
+    miner_prefetch_hf_model "$REPO_ROOT"
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -532,6 +619,7 @@ case "$CMD" in
     install)    cmd_install "$@" ;;
     configure)  cmd_configure "$@" ;;
     https)      cmd_https "$@" ;;
+    prefetch)   cmd_prefetch "$@" ;;
     check)      cmd_check "$@" ;;
     check-audit) cmd_check_audit "$@" ;;
     start)      cmd_start "$@" ;;

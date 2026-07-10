@@ -11,12 +11,16 @@ HOTKEY_NAME="default"
 NETWORK="finney"
 NETUID=96
 
-# Public HTTPS URL validators use to reach your miner (required on mainnet)
-# Example: https://203.0.113.10:443  or  https://203.0.113.10:8443
-ENDPOINT="https://YOUR_PUBLIC_IP:443"
+# Public IP validators use to reach your miner(s)
+PUBLIC_IP="YOUR_PUBLIC_IP"
 
-# HTTPS reverse proxy (nginx) — setup with: ./miner https
-HTTPS_PORT=443
+# Primary miner endpoint (GPU 0). GPU N uses https://PUBLIC_IP:(HTTPS_PORT+N)
+# Example: https://203.0.113.10:40000
+ENDPOINT="https://YOUR_PUBLIC_IP:40000"
+
+# Base ports for GPU 0. GPU N uses HTTPS_PORT+N and BACKEND_PORT+N.
+# Example 4-GPU host: public 40000–40003, backends 8000–8003
+HTTPS_PORT=40000
 BACKEND_PORT=8000
 
 # Model: "auto" picks the best model for your GPU (recommended for L40 48GB)
@@ -26,6 +30,14 @@ MODEL_ID="auto"
 PM2_NAME="miner"
 USE_PM2=true
 
+# Multi-GPU: one miner process per GPU on the same host
+# Set MULTI_GPU=true and GPU_COUNT to the number of GPUs you want to use.
+# ./miner start regenerates ecosystem.config.js and starts all miners.
+# ./miner https sets up nginx for every GPU port.
+MULTI_GPU=false
+GPU_COUNT=1
+
 # Hugging Face token (optional) — higher download rate limits
+# Required for reliable model prefetch (vLLM only downloads weight shards).
 # Get one at https://huggingface.co/settings/tokens
 # export HF_TOKEN="hf_..."
