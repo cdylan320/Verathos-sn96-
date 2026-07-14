@@ -580,6 +580,7 @@ cmd_help() {
     check       Preflight: GPU, wallet, venv, endpoint
     check-audit Hot-capacity audit: wheel, worker logs, validator ingest
     start       Start miner (PM2 background)
+    restart-staggered  Stop + start multi-GPU miners 3 min apart (reduces RPC 429s)
     stop        Stop miner
     status      Show GPU + PM2 status
     logs        Tail miner logs (default 80 lines)
@@ -613,6 +614,26 @@ cmd_prefetch() {
     miner_prefetch_hf_model "$REPO_ROOT"
 }
 
+cmd_restart_staggered() {
+    miner_banner
+    miner_load_config "$REPO_ROOT"
+    miner_source_env "$REPO_ROOT"
+    local delay="${STAGGER_DELAY_SEC:-180}"
+    if ! command -v pm2 &>/dev/null; then
+        miner_die "PM2 not installed"
+    fi
+    if ! miner_is_multi_gpu; then
+        miner_warn "Single-GPU host — using normal restart"
+        cmd_stop
+        cmd_start "$@"
+        return 0
+    fi
+    miner_start_staggered "$REPO_ROOT" "$delay"
+    echo ""
+    miner_info "Logs:   ./miner logs"
+    miner_info "Status: ./miner status"
+}
+
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 case "$CMD" in
     setup)      cmd_setup "$@" ;;
@@ -625,6 +646,7 @@ case "$CMD" in
     start)      cmd_start "$@" ;;
     stop)       cmd_stop "$@" ;;
     restart)    cmd_stop; cmd_start "$@" ;;
+    restart-staggered) cmd_restart_staggered "$@" ;;
     status)     cmd_status "$@" ;;
     logs)       cmd_logs "$@" ;;
     evm)        cmd_evm "$@" ;;

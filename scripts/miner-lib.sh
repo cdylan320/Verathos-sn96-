@@ -365,6 +365,44 @@ miner_setup_https_all() {
     fi
 }
 
+miner_start_staggered() {
+    local repo="$1"
+    local delay_s="${2:-180}"
+    local conf="$repo/ecosystem.config.js"
+    local names=() name i=0
+
+    if [ ! -f "$conf" ]; then
+        miner_die "ecosystem.config.js not found"
+    fi
+    cd "$repo" || miner_die "Cannot cd to $repo"
+    mapfile -t names < <(node -e "
+      const c = require('./ecosystem.config.js');
+      for (const a of (c.apps || [])) console.log(a.name);
+    ")
+    if [ "${#names[@]}" -eq 0 ]; then
+        miner_die "No PM2 apps in ecosystem.config.js"
+    fi
+
+    miner_step "Staggered PM2 start (${#names[@]} miners, ${delay_s}s gap — eases public RPC rate limits)"
+    pm2 stop ecosystem.config.js 2>/dev/null || true
+    for name in "${names[@]}"; do
+        pm2 delete "$name" 2>/dev/null || true
+    done
+
+    for name in "${names[@]}"; do
+        if [ "$i" -gt 0 ]; then
+            miner_info "Waiting ${delay_s}s before ${name}..."
+            sleep "$delay_s"
+        fi
+        miner_info "Starting ${name}..."
+        pm2 start ecosystem.config.js --only "$name"
+        i=$((i + 1))
+    done
+    pm2 save 2>/dev/null || true
+    miner_ok "Staggered start complete"
+    miner_info "Avoid: pm2 restart all  (use: ./miner restart-staggered)"
+}
+
 miner_prompt_yesno() {
     local prompt_text="$1"
     local default_yes="${2:-y}"

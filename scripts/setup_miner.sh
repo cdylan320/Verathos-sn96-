@@ -166,8 +166,8 @@ if ! command -v nvidia-smi &>/dev/null; then
     echo "  ERROR: nvidia-smi not found. NVIDIA GPU required."
     exit 1
 fi
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+GPU_NAME=$(nvidia-smi -i 0 --query-gpu=name --format=csv,noheader 2>/dev/null)
+GPU_VRAM=$(nvidia-smi -i 0 --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null)
 if [ -z "$GPU_NAME" ]; then
     echo "  ERROR: No GPU detected."
     exit 1
@@ -176,8 +176,8 @@ if [ "${GPU_VRAM:-0}" -lt 20000 ] 2>/dev/null; then
     echo "  ERROR: GPU has ${GPU_VRAM}MB VRAM. Minimum 24GB required."
     exit 1
 fi
-GPU_SM=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
-GPU_DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+GPU_SM=$(nvidia-smi -i 0 --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '.')
+GPU_DRIVER=$(nvidia-smi -i 0 --query-gpu=driver_version --format=csv,noheader 2>/dev/null)
 GPU_DRIVER_MAJOR=$(echo "$GPU_DRIVER" | cut -d. -f1)
 echo "  GPU: $GPU_NAME (${GPU_VRAM}MB, sm_${GPU_SM}, driver ${GPU_DRIVER})"
 # Early check: RTX 5090 requires NVIDIA driver >= 575.
