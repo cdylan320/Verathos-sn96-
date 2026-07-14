@@ -82,6 +82,19 @@ class NeuronConfig(ChainConfig):
     subnet_config_cache_path: str = ""
     subnet_config_disable: bool = False
 
+    # Operator-controlled maintenance grace. Intended for coordinated releases
+    # where validators should keep measuring but temporarily avoid penalties.
+    maintenance_grace_enabled: bool = False
+    maintenance_grace_open_ended: bool = False
+    maintenance_grace_until_epoch: int | None = None
+    maintenance_grace_until_unix_ts: int | None = None
+    maintenance_grace_reason: str = ""
+    maintenance_grace_suppress_score_zeroing: bool = True
+    maintenance_grace_suppress_probation: bool = True
+    maintenance_grace_suppress_capacity_score_gate: bool = True
+    maintenance_grace_suppress_report_offline: bool = True
+    maintenance_grace_suppress_proxy_proof_strikes: bool = True
+
     # Hot-capacity audit windows. Enabled by default; observe mode records
     # receipts/verdicts without affecting endpoint score.
     capacity_audit_enabled: bool = True
@@ -113,7 +126,11 @@ class NeuronConfig(ChainConfig):
     capacity_audit_repeat_window_epochs: int = 20
     capacity_audit_timing_misses_for_zero_score: int = 2
     capacity_audit_hard_proof_misses_for_zero_score: int = 2
+    capacity_audit_invalid_proof_misses_for_zero_score: int = 1
     capacity_audit_allow_timing_only_score_gate: bool = True
+    capacity_audit_uid_escalation_min_entries: int = 2
+    capacity_audit_uid_escalation_fraction: float = 0.10
+    capacity_audit_uid_escalation_max_entries: int = 10
     capacity_audit_slot_refresh_blocks: int = 0
     capacity_audit_slot_snapshot_stale_blocks: int = 0
     capacity_audit_proof_verify_workers: int = 4
@@ -156,6 +173,16 @@ class NeuronConfig(ChainConfig):
             "subnet_config_timeout_seconds": "VERATHOS_SUBNET_CONFIG_TIMEOUT_SECONDS",
             "subnet_config_cache_path": "VERATHOS_SUBNET_CONFIG_CACHE_PATH",
             "subnet_config_disable": "VERATHOS_SUBNET_CONFIG_DISABLE",
+            "maintenance_grace_enabled": "VERATHOS_MAINTENANCE_GRACE_ENABLED",
+            "maintenance_grace_open_ended": "VERATHOS_MAINTENANCE_GRACE_OPEN_ENDED",
+            "maintenance_grace_until_epoch": "VERATHOS_MAINTENANCE_GRACE_UNTIL_EPOCH",
+            "maintenance_grace_until_unix_ts": "VERATHOS_MAINTENANCE_GRACE_UNTIL_UNIX_TS",
+            "maintenance_grace_reason": "VERATHOS_MAINTENANCE_GRACE_REASON",
+            "maintenance_grace_suppress_score_zeroing": "VERATHOS_MAINTENANCE_GRACE_SUPPRESS_SCORE_ZEROING",
+            "maintenance_grace_suppress_probation": "VERATHOS_MAINTENANCE_GRACE_SUPPRESS_PROBATION",
+            "maintenance_grace_suppress_capacity_score_gate": "VERATHOS_MAINTENANCE_GRACE_SUPPRESS_CAPACITY_SCORE_GATE",
+            "maintenance_grace_suppress_report_offline": "VERATHOS_MAINTENANCE_GRACE_SUPPRESS_REPORT_OFFLINE",
+            "maintenance_grace_suppress_proxy_proof_strikes": "VERATHOS_MAINTENANCE_GRACE_SUPPRESS_PROXY_PROOF_STRIKES",
             "capacity_audit_enabled": "VERATHOS_CAPACITY_AUDIT_ENABLED",
             "capacity_audit_mode": "VERATHOS_CAPACITY_AUDIT_MODE",
             "capacity_audit_ingest_host": "VERATHOS_CAPACITY_AUDIT_INGEST_HOST",
@@ -185,7 +212,11 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_repeat_window_epochs": "VERATHOS_CAPACITY_AUDIT_REPEAT_WINDOW_EPOCHS",
             "capacity_audit_timing_misses_for_zero_score": "VERATHOS_CAPACITY_AUDIT_TIMING_MISSES_FOR_ZERO_SCORE",
             "capacity_audit_hard_proof_misses_for_zero_score": "VERATHOS_CAPACITY_AUDIT_HARD_PROOF_MISSES_FOR_ZERO_SCORE",
+            "capacity_audit_invalid_proof_misses_for_zero_score": "VERATHOS_CAPACITY_AUDIT_INVALID_PROOF_MISSES_FOR_ZERO_SCORE",
             "capacity_audit_allow_timing_only_score_gate": "VERATHOS_CAPACITY_AUDIT_ALLOW_TIMING_ONLY_SCORE_GATE",
+            "capacity_audit_uid_escalation_min_entries": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_MIN_ENTRIES",
+            "capacity_audit_uid_escalation_fraction": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_FRACTION",
+            "capacity_audit_uid_escalation_max_entries": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_MAX_ENTRIES",
             "capacity_audit_slot_refresh_blocks": "VERATHOS_CAPACITY_AUDIT_SLOT_REFRESH_BLOCKS",
             "capacity_audit_slot_snapshot_stale_blocks": "VERATHOS_CAPACITY_AUDIT_SLOT_SNAPSHOT_STALE_BLOCKS",
             "capacity_audit_proof_verify_workers": "VERATHOS_CAPACITY_AUDIT_PROOF_VERIFY_WORKERS",
@@ -200,6 +231,7 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_payload_deadline_s",
             "capacity_audit_max_drain_fraction",
             "capacity_audit_group_stress_fraction",
+            "capacity_audit_uid_escalation_fraction",
             "capacity_audit_min_registration_age_s",
             "capacity_audit_worker_poll_s",
             "subnet_config_refresh_seconds", "subnet_config_timeout_seconds",
@@ -219,10 +251,14 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_repeat_window_epochs",
             "capacity_audit_timing_misses_for_zero_score",
             "capacity_audit_hard_proof_misses_for_zero_score",
+            "capacity_audit_invalid_proof_misses_for_zero_score",
+            "capacity_audit_uid_escalation_min_entries",
+            "capacity_audit_uid_escalation_max_entries",
             "capacity_audit_slot_refresh_blocks",
             "capacity_audit_slot_snapshot_stale_blocks",
             "capacity_audit_proof_verify_workers",
             "capacity_audit_max_proof_payload_bytes",
+            "maintenance_grace_until_epoch", "maintenance_grace_until_unix_ts",
         }
         _bool_fields = {
             "demand_bonus_enabled", "x402_testnet",
@@ -230,6 +266,13 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_allow_timing_only_score_gate",
             "capacity_audit_serve_axon",
             "subnet_config_disable",
+            "maintenance_grace_enabled",
+            "maintenance_grace_open_ended",
+            "maintenance_grace_suppress_score_zeroing",
+            "maintenance_grace_suppress_probation",
+            "maintenance_grace_suppress_capacity_score_gate",
+            "maintenance_grace_suppress_report_offline",
+            "maintenance_grace_suppress_proxy_proof_strikes",
         }
 
         for attr, env_var in neuron_env.items():

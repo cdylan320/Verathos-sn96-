@@ -494,7 +494,7 @@ class ValidatorStateDB:
 
         with self._lock:
             row = self._conn.execute(
-                "SELECT model_id FROM miner_entries "
+                "SELECT model_id, endpoint, quant, max_context_len FROM miner_entries "
                 "WHERE address = ? AND model_index = ?",
                 (address, model_index),
             ).fetchone()
@@ -533,41 +533,52 @@ class ValidatorStateDB:
                             probation_entered_epoch = NULL,
                             probation_consecutive_passes = 0,
                             tee_enabled = ?, tee_platform = ?,
-                            gpu_name = COALESCE(NULLIF(?, ''), gpu_name),
-                            gpu_count = CASE WHEN ? > 0 THEN ? ELSE gpu_count END,
-                            vram_gb = CASE WHEN ? > 0 THEN ? ELSE vram_gb END,
-                            compute_capability = COALESCE(NULLIF(?, ''), compute_capability),
-                            gpu_uuids = CASE WHEN ? != '[]' THEN ? ELSE gpu_uuids END,
+                            gpu_name = ?, gpu_count = ?, vram_gb = ?,
+                            compute_capability = ?, gpu_uuids = ?,
                             hotkey_ss58 = COALESCE(NULLIF(?, ''), hotkey_ss58),
                             coldkey_ss58 = COALESCE(NULLIF(?, ''), coldkey_ss58),
                             updated_at = ?
                         WHERE address = ? AND model_index = ?""",
                         (model_id, endpoint, quant, max_context_len,
                          epoch, 1 if tee_enabled else 0, tee_platform,
-                         gpu_name, gpu_count, gpu_count, vram_gb, vram_gb, compute_capability,
-                         _gpu_uuids_json, _gpu_uuids_json,
+                         gpu_name, gpu_count, vram_gb, compute_capability,
+                         _gpu_uuids_json,
                          hotkey_ss58, coldkey_ss58, now, address, model_index),
                     )
                     bt.logging.info(f"Model switch for {address[:10]} idx={model_index}: {old_model_id} -> {model_id} (score reset)")
                 else:
                     # Same model — update endpoint/quant/epoch, keep scores
+                    registration_changed = (
+                        str(row["endpoint"] or "") != endpoint
+                        or str(row["quant"] or "") != quant
+                        or int(row["max_context_len"] or 0) != int(max_context_len or 0)
+                    )
                     self._conn.execute(
                         """UPDATE miner_entries SET
                             endpoint = ?, quant = ?, max_context_len = ?,
                             last_seen_epoch = ?, is_active = 1,
                             tee_enabled = ?, tee_platform = ?,
-                            gpu_name = COALESCE(NULLIF(?, ''), gpu_name),
-                            gpu_count = CASE WHEN ? > 0 THEN ? ELSE gpu_count END,
-                            vram_gb = CASE WHEN ? > 0 THEN ? ELSE vram_gb END,
-                            compute_capability = COALESCE(NULLIF(?, ''), compute_capability),
-                            gpu_uuids = CASE WHEN ? != '[]' THEN ? ELSE gpu_uuids END,
+                            gpu_name = CASE
+                                WHEN ? THEN ? ELSE COALESCE(NULLIF(?, ''), gpu_name) END,
+                            gpu_count = CASE
+                                WHEN ? THEN ? WHEN ? > 0 THEN ? ELSE gpu_count END,
+                            vram_gb = CASE
+                                WHEN ? THEN ? WHEN ? > 0 THEN ? ELSE vram_gb END,
+                            compute_capability = CASE
+                                WHEN ? THEN ? ELSE COALESCE(NULLIF(?, ''), compute_capability) END,
+                            gpu_uuids = CASE
+                                WHEN ? THEN ? WHEN ? != '[]' THEN ? ELSE gpu_uuids END,
                             hotkey_ss58 = COALESCE(NULLIF(?, ''), hotkey_ss58),
                             coldkey_ss58 = COALESCE(NULLIF(?, ''), coldkey_ss58),
                             updated_at = ?
                         WHERE address = ? AND model_index = ?""",
                         (endpoint, quant, max_context_len, epoch,
                          1 if tee_enabled else 0, tee_platform,
-                         gpu_name, gpu_count, gpu_count, vram_gb, vram_gb, compute_capability,
+                         registration_changed, gpu_name, gpu_name,
+                         registration_changed, gpu_count, gpu_count, gpu_count,
+                         registration_changed, vram_gb, vram_gb, vram_gb,
+                         registration_changed, compute_capability, compute_capability,
+                         registration_changed, _gpu_uuids_json,
                          _gpu_uuids_json, _gpu_uuids_json,
                          hotkey_ss58, coldkey_ss58, now, address, model_index),
                     )
@@ -609,6 +620,15 @@ class ValidatorStateDB:
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM miner_entries WHERE is_active = 1"
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_capacity_hardware_cache_entries(self) -> List[dict]:
+        """Return exact-registration rows with reusable last-good hardware metadata."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """SELECT * FROM miner_entries
+                   WHERE gpu_name != '' AND gpu_count > 0 AND vram_gb > 0"""
             )
             return [dict(row) for row in cursor.fetchall()]
 
@@ -1713,6 +1733,53 @@ class ValidatorStateDB:
             ).fetchone()
         return int(row["n"] if row is not None else 0)
 
+    def recent_invalid_capacity_proof_failures(
+        self,
+        address: str,
+        model_index: int,
+        *,
+        since_epoch: int,
+        require_chain_confirmed: bool = False,
+    ) -> int:
+        confirmation_clause = ""
+        if require_chain_confirmed:
+            confirmation_clause = (
+                " AND w.selection_finalized_at IS NOT NULL"
+                " AND w.audit_finalized_at IS NOT NULL"
+                " AND ("
+                "   w.proof_challenge_block <= 0"
+                "   OR ("
+                "     w.proof_challenge_block_hash != ''"
+                "     AND w.proof_challenge_finalized_at IS NOT NULL"
+                "   )"
+                " )"
+                " AND w.chain_status != 'reorged'"
+            )
+        with self._lock:
+            row = self._conn.execute(
+                f"""SELECT COUNT(*) AS n
+                    FROM capacity_audit_slots s
+                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                    WHERE s.miner_address = ?
+                      AND s.model_index = ?
+                      AND w.epoch_number >= ?
+                      AND s.verdict = 'hard_proof_miss'
+                      AND (
+                        s.failure_reason = 'pass0_root_mismatch'
+                        OR (
+                          s.proof_status = 'invalid_payload'
+                          AND s.failure_reason NOT IN (
+                            'unsupported_proof_payload_format',
+                            'unsupported_combined_format',
+                            'unsupported_combined_workload'
+                          )
+                        )
+                      )
+                      {confirmation_clause}""",
+                (address.lower(), int(model_index), int(since_epoch)),
+            ).fetchone()
+        return int(row["n"] if row is not None else 0)
+
     def recent_capacity_failures_for_uid(
         self,
         uid: int,
@@ -1751,6 +1818,88 @@ class ValidatorStateDB:
                       )
                       {confirmation_clause}""",
                 (int(since_epoch), *verdicts, int(uid), int(uid)),
+            ).fetchone()
+        return int(row["n"] if row is not None else 0)
+
+    def recent_capacity_failure_counts_for_uid(
+        self,
+        uid: int,
+        *,
+        since_epoch: int,
+        require_chain_confirmed: bool = False,
+    ) -> Dict[Tuple[str, int], dict]:
+        """Return finalized failure counts grouped by the registered endpoint slot."""
+        confirmation_clause = ""
+        if require_chain_confirmed:
+            confirmation_clause = (
+                " AND w.selection_finalized_at IS NOT NULL"
+                " AND w.audit_finalized_at IS NOT NULL"
+                " AND ("
+                "   w.proof_challenge_block <= 0"
+                "   OR ("
+                "     w.proof_challenge_block_hash != ''"
+                "     AND w.proof_challenge_finalized_at IS NOT NULL"
+                "   )"
+                " )"
+                " AND w.chain_status != 'reorged'"
+            )
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT
+                        s.miner_address,
+                        s.model_index,
+                        SUM(CASE
+                            WHEN s.verdict = 'hard_proof_miss'
+                             AND (
+                               s.failure_reason = 'pass0_root_mismatch'
+                               OR (
+                                 s.proof_status = 'invalid_payload'
+                                 AND s.failure_reason NOT IN (
+                                   'unsupported_proof_payload_format',
+                                   'unsupported_combined_format',
+                                   'unsupported_combined_workload'
+                                 )
+                               )
+                             )
+                            THEN 1 ELSE 0 END
+                        ) AS invalid_proof_failures,
+                        SUM(CASE
+                            WHEN s.verdict IN ('hard_proof_miss', 'no_show')
+                            THEN 1 ELSE 0 END
+                        ) AS hard_failures,
+                        SUM(CASE
+                            WHEN s.verdict = 'timing_miss'
+                            THEN 1 ELSE 0 END
+                        ) AS timing_failures
+                    FROM capacity_audit_slots s
+                    JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                    WHERE w.epoch_number >= ?
+                      AND (
+                        s.miner_uid = ?
+                        OR s.miner_address IN (
+                          SELECT address FROM miner_entries WHERE bittensor_uid = ?
+                        )
+                      )
+                      AND s.verdict IN ('hard_proof_miss', 'no_show', 'timing_miss')
+                      {confirmation_clause}
+                    GROUP BY s.miner_address, s.model_index""",
+                (int(since_epoch), int(uid), int(uid)),
+            ).fetchall()
+        return {
+            (str(row["miner_address"]).lower(), int(row["model_index"])): {
+                "invalid_proof_failures": int(row["invalid_proof_failures"] or 0),
+                "hard_failures": int(row["hard_failures"] or 0),
+                "timing_failures": int(row["timing_failures"] or 0),
+            }
+            for row in rows
+        }
+
+    def active_entry_count_for_uid(self, uid: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT COUNT(*) AS n FROM miner_entries
+                   WHERE is_active = 1 AND bittensor_uid = ?""",
+                (int(uid),),
             ).fetchone()
         return int(row["n"] if row is not None else 0)
 
