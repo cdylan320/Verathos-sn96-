@@ -23,7 +23,7 @@ module.exports = {
     {
       name: "miner",
       script: ".venv-vllm/bin/python",
-      args: "-u -m neurons.miner --wallet <WALLET> --hotkey <HOTKEY> --netuid 96 --subtensor-network finney --model-id auto --endpoint https://YOUR_PUBLIC_IP:40000 --port 8000 --auto-update",
+      args: "-u -m neurons.miner --wallet <WALLET> --hotkey <HOTKEY> --netuid 96 --subtensor-network finney --model-id auto --endpoint https://YOUR_PUBLIC_IP:40000 --port 8000 --auto-update --capacity-audit-worker-poll-s 30",
       cwd: REPO,
       env: { ...baseEnv, CUDA_VISIBLE_DEVICES: "0" },
       autorestart: false,
