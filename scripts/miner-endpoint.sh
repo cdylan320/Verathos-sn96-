@@ -31,10 +31,12 @@ die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-List on-chain model indices for a hotkey's EVM wallet (with probation), or updateEndpoint.
+List on-chain model indices for a hotkey's EVM wallet (with probation), updateEndpoint,
+or show EVM balance.
 
 Usage:
   ./scripts/miner-endpoint.sh list [--wallet NAME] [--hotkey NAME] [--all]
+  ./scripts/miner-endpoint.sh balance [--wallet NAME] [--hotkey NAME]
   ./scripts/miner-endpoint.sh update --index N --endpoint URL [--wallet NAME] [--hotkey NAME] [--renew]
 
 Defaults: wallet/hotkey from miner.conf when present.
@@ -46,6 +48,7 @@ registerModel (reactivates that index). Probation stays with the index.
 
 Examples:
   ./scripts/miner-endpoint.sh list --hotkey hk_0
+  ./scripts/miner-endpoint.sh balance --hotkey hk_0
   ./scripts/miner-endpoint.sh list --hotkey hk_0 --all
   ./scripts/miner-endpoint.sh update --hotkey hk_0 --index 61 \
       --endpoint https://n1.de.clorecloud.net:2687 --renew
@@ -68,8 +71,8 @@ shift || true
 
 case "$CMD" in
     -h|--help|help) usage 0 ;;
-    list|update) ;;
-    *) die "unknown command: $CMD (use list|update)" ;;
+    list|update|balance) ;;
+    *) die "unknown command: $CMD (use list|balance|update)" ;;
 esac
 
 load_conf_defaults
@@ -211,6 +214,14 @@ def proxy_cols(i: int) -> tuple[str, str, str]:
 
 print(f"wallet={wallet_name} hotkey={hotkey_name}")
 print(f"evm={evm_addr} uid={uid} balance={bal:.6f} TAO slots={len(models)}")
+
+if cmd == "balance":
+    # Compact one-liner friendly output after the header above.
+    print(f"balance_tao={bal:.6f}")
+    print(f"balance_rao={int(bal * 1e9)}")
+    if bal < 0.005:
+        print("warning: low balance — renewModel/register/updateEndpoint may fail")
+    raise SystemExit(0)
 
 if cmd == "list":
     rows = []
