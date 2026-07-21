@@ -24,6 +24,7 @@ INDEX=""
 ENDPOINT=""
 SHOW_ALL=0
 DO_RENEW=0
+ASSUME_YES=0
 RPC_URL="${VERATHOS_RPC_URL:-https://lite.chain.opentensor.ai}"
 CHAIN_CONFIG="${VERATHOS_CHAIN_CONFIG:-$REPO_ROOT/chain_config_mainnet.json}"
 
@@ -31,27 +32,29 @@ die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-List on-chain model indices for a hotkey's EVM wallet (with probation), updateEndpoint,
-or show EVM balance.
+Manage on-chain model slots for a hotkey's EVM wallet.
 
 Usage:
   ./scripts/miner-endpoint.sh list [--wallet NAME] [--hotkey NAME] [--all]
   ./scripts/miner-endpoint.sh balance [--wallet NAME] [--hotkey NAME]
   ./scripts/miner-endpoint.sh update --index N --endpoint URL [--wallet NAME] [--hotkey NAME] [--renew]
+  ./scripts/miner-endpoint.sh deactivate --index N [--wallet NAME] [--hotkey NAME] [--yes]
+  ./scripts/miner-endpoint.sh cleanup --index N [--wallet NAME] [--hotkey NAME] [--yes]
 
 Defaults: wallet/hotkey from miner.conf when present.
-Probation/score come from https://api.verathos.ai/v1/network/stats (best-effort).
+Probation/score from https://api.verathos.ai/v1/network/stats (best-effort).
 
-Expired slots: updateEndpoint works, but renewModel does NOT. To revive an expired
-index keep the same model+quant: updateEndpoint(index, newUrl) then let the miner
-registerModel (reactivates that index). Probation stays with the index.
+cleanup  — remove slot only if expired > 30 days. Uses gas (storage refund may
+           lower net cost). Removes from chain array → drops off dashboard.
+deactivate — mark inactive now (ACTIVE/probation slots). Uses gas. Hides from
+           discovery/dashboard while lease would still be running. Does NOT
+           clear probation history for that index.
 
 Examples:
   ./scripts/miner-endpoint.sh list --hotkey hk_0
   ./scripts/miner-endpoint.sh balance --hotkey hk_0
-  ./scripts/miner-endpoint.sh list --hotkey hk_0 --all
-  ./scripts/miner-endpoint.sh update --hotkey hk_0 --index 61 \
-      --endpoint https://n1.de.clorecloud.net:2687 --renew
+  ./scripts/miner-endpoint.sh deactivate --hotkey hk_0 --index 54 --yes
+  ./scripts/miner-endpoint.sh cleanup --hotkey hk_0 --index 0 --yes
 EOF
     exit "${1:-0}"
 }
@@ -71,8 +74,8 @@ shift || true
 
 case "$CMD" in
     -h|--help|help) usage 0 ;;
-    list|update|balance) ;;
-    *) die "unknown command: $CMD (use list|balance|update)" ;;
+    list|update|balance|cleanup|deactivate) ;;
+    *) die "unknown command: $CMD (use list|balance|update|deactivate|cleanup)" ;;
 esac
 
 load_conf_defaults
@@ -85,6 +88,7 @@ while [ $# -gt 0 ]; do
         --endpoint) ENDPOINT="${2:-}"; shift 2 ;;
         --all) SHOW_ALL=1; shift ;;
         --renew) DO_RENEW=1; shift ;;
+        --yes|-y) ASSUME_YES=1; shift ;;
         --rpc-url) RPC_URL="${2:-}"; shift 2 ;;
         --chain-config) CHAIN_CONFIG="${2:-}"; shift 2 ;;
         -h|--help) usage 0 ;;
@@ -119,6 +123,7 @@ export VERATHOS_INDEX="${INDEX:-}"
 export VERATHOS_ENDPOINT="${ENDPOINT:-}"
 export VERATHOS_SHOW_ALL="$SHOW_ALL"
 export VERATHOS_DO_RENEW="$DO_RENEW"
+export VERATHOS_ASSUME_YES="$ASSUME_YES"
 
 cd "$REPO_ROOT"
 exec "$PYTHON" - <<'PY'
@@ -143,15 +148,25 @@ hotkey_name = os.environ["VERATHOS_HOTKEY"]
 cmd = os.environ["VERATHOS_CMD"]
 show_all = os.environ.get("VERATHOS_SHOW_ALL", "0") == "1"
 do_renew = os.environ.get("VERATHOS_DO_RENEW", "0") == "1"
+assume_yes = os.environ.get("VERATHOS_ASSUME_YES", "0") == "1"
 index_s = os.environ.get("VERATHOS_INDEX", "").strip()
 new_endpoint = os.environ.get("VERATHOS_ENDPOINT", "").strip()
 rpc_url = os.environ["VERATHOS_RPC_URL"]
 chain_config = os.environ["VERATHOS_CHAIN_CONFIG"]
+CLEANUP_GRACE_SEC = 30 * 24 * 3600
 
 
 def fail(msg: str, code: int = 1) -> None:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def confirm(msg: str) -> None:
+    if assume_yes:
+        return
+    ans = input(f"{msg} [y/N] ").strip().lower()
+    if ans not in ("y", "yes"):
+        fail("aborted", 0)
 
 
 def fetch_proxy_by_index(address: str) -> dict[int, dict]:
@@ -249,14 +264,70 @@ if cmd == "list":
     print(f"probation_slots={n_prob} (from api.verathos.ai; ? = not in proxy view)")
     raise SystemExit(0)
 
+
+def require_index() -> int:
+    if not index_s.isdigit():
+        fail("--index N required")
+    idx = int(index_s)
+    if idx < 0 or idx >= len(models):
+        fail(f"index {idx} out of range (0..{len(models)-1})")
+    return idx
+
+
+if cmd == "deactivate":
+    index = require_index()
+    m = models[index]
+    st = status_of(m)
+    prob, healthy, score_s = proxy_cols(index)
+    print(f"deactivate idx={index} status={st} rem_h={(m.expires_at-now)/3600:+.2f}")
+    print(f"probation={prob} healthy={healthy} score={score_s}")
+    print(f"model={m.model_id} endpoint={m.endpoint}")
+    print("note: uses gas; hides from dashboard/discovery; does not clear probation")
+    if st != "ACTIVE" and not m.active:
+        print("already inactive")
+        raise SystemExit(0)
+    confirm(f"deactivate index {index}?")
+    tx = client.deactivate_model(index, private_key=evm_pk)
+    print(f"deactivateModel tx={tx}")
+    time.sleep(6)
+    client._cache._store.clear()
+    m = client.get_miner_models(evm_addr)[index]
+    print(f"after: active={m.active} status={status_of(m)}")
+    print(f"balance={client._provider.w3.eth.get_balance(evm_addr)/1e18:.6f} TAO")
+    print("OK")
+    raise SystemExit(0)
+
+if cmd == "cleanup":
+    index = require_index()
+    m = models[index]
+    st = status_of(m)
+    rem_h = (m.expires_at - now) / 3600
+    eligible_at = m.expires_at + CLEANUP_GRACE_SEC
+    days_left = (eligible_at - now) / (24 * 3600)
+    print(f"cleanup idx={index} status={st} rem_h={rem_h:+.2f}")
+    print(f"model={m.model_id} endpoint={m.endpoint}")
+    print("note: uses gas (storage refund may reduce net cost); removes array slot")
+    if now < eligible_at:
+        fail(
+            f"not eligible yet — need expiresAt+30d "
+            f"(~{days_left:.1f} days left). For ACTIVE/probation use: "
+            f"deactivate --index {index}"
+        )
+    confirm(f"cleanup (delete) index {index}? swap-and-pop may move last slot into {index}")
+    tx = client.cleanup(evm_addr, index, private_key=evm_pk)
+    print(f"cleanup tx={tx}")
+    time.sleep(6)
+    client._cache._store.clear()
+    left = client.get_miner_model_count(evm_addr)
+    print(f"after: slots={left}")
+    print(f"balance={client._provider.w3.eth.get_balance(evm_addr)/1e18:.6f} TAO")
+    print("OK")
+    raise SystemExit(0)
+
 # update
-if not index_s.isdigit():
-    fail("--index N required for update")
+index = require_index()
 if not new_endpoint:
     fail("--endpoint URL required for update")
-index = int(index_s)
-if index < 0 or index >= len(models):
-    fail(f"index {index} out of range (0..{len(models)-1})")
 
 m = models[index]
 st = status_of(m)
