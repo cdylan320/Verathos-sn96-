@@ -5,6 +5,7 @@
 #
 # Usage (from repo root):
 #   ./miner setup        # First time: install + configure + HTTPS (guided)
+#   ./miner check-host   # Before setup: qualify GPU, CPU/RAM, disk, network
 #   ./miner configure    # Edit wallet, endpoint, model settings
 #   ./miner check        # Preflight before starting
 #   ./miner check-audit  # Hot-capacity audit preflight (wheel, worker, ingest)
@@ -208,6 +209,11 @@ cmd_https() {
     else
         bash "$REPO_ROOT/scripts/setup_https.sh" --port "$HTTPS_PORT" --backend-port "$BACKEND_PORT"
     fi
+}
+
+# ── check-host: dependency-free pre-setup host qualification ─────────────────
+cmd_check_host() {
+    exec python3 "$REPO_ROOT/scripts/check_miner_host.py" "$@"
 }
 
 # ── check: preflight ─────────────────────────────────────────────────────────
@@ -577,6 +583,7 @@ cmd_help() {
     configure   Interactive wallet / endpoint / model settings
     https       Setup nginx HTTPS reverse proxy (self-signed cert)
     prefetch    Download full HuggingFace model snapshot (fixes IncompleteSnapshotError)
+    check-host  Before setup: detailed GPU, CPU/RAM, disk, network qualification
     check       Preflight: GPU, wallet, venv, endpoint
     check-audit Hot-capacity audit: wheel, worker logs, validator ingest
     start       Start miner (PM2 background)
@@ -641,6 +648,7 @@ case "$CMD" in
     configure)  cmd_configure "$@" ;;
     https)      cmd_https "$@" ;;
     prefetch)   cmd_prefetch "$@" ;;
+    check-host) cmd_check_host "$@" ;;
     check)      cmd_check "$@" ;;
     check-audit) cmd_check_audit "$@" ;;
     start)      cmd_start "$@" ;;
