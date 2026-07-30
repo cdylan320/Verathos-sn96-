@@ -427,9 +427,22 @@ miner_pm2_log_text() {
 }
 
 # Scan miner logs for capacity-audit worker state.
+# Long-running miners rotate the "worker started" line out of the recent
+# window; treat recent audit activity / older startup lines as alive.
+# Grep log files directly — PM2 logs can contain binary bytes that break
+# shell-variable + pipe greps.
 miner_check_capacity_audit_worker_logs() {
     local pm2_name="$1"
-    local log_text=""
+    local home_dir="${HOME:-/root}"
+    local out_log="$home_dir/.pm2/logs/${pm2_name}-out.log"
+    local err_log="$home_dir/.pm2/logs/${pm2_name}-error.log"
+    local recent_tmp=""
+    local history_tmp=""
+    local worker_line=""
+    local activity_line=""
+    local publish_line=""
+    local search_files=()
+    local recent_files=()
 
     if ! command -v pm2 &>/dev/null; then
         miner_warn "PM2 not installed — cannot inspect capacity-audit worker logs"
@@ -442,53 +455,99 @@ miner_check_capacity_audit_worker_logs() {
     fi
     miner_ok "PM2 process '$pm2_name' is running"
 
-    log_text="$(miner_pm2_log_text "$pm2_name" 800 || true)"
-    if [ -z "$log_text" ]; then
-        miner_warn "Could not read PM2 logs for '$pm2_name'"
-        return 2
+    # Full history: prove the worker started at least once.
+    if [ -f "$out_log" ]; then
+        search_files+=("$out_log")
+    fi
+    if [ -f "$err_log" ]; then
+        search_files+=("$err_log")
     fi
 
-    if echo "$log_text" | grep -qiE "Capacity audit miner worker disabled|hot-capacity workspace extension unavailable"; then
+    # Recent window only: transport errors / missing endpoints should not
+    # fail the check forever after a transient blip days ago.
+    recent_tmp="$(mktemp)"
+    history_tmp="$(mktemp)"
+    if [ "${#search_files[@]}" -gt 0 ]; then
+        # ~last 3000 lines across out+err is enough for current health.
+        for f in "${search_files[@]}"; do
+            tail -n 3000 "$f" >>"$recent_tmp" 2>/dev/null || true
+        done
+        recent_files=("$recent_tmp")
+    else
+        miner_pm2_log_text "$pm2_name" 2000 >"$recent_tmp" 2>/dev/null || true
+        if [ ! -s "$recent_tmp" ]; then
+            rm -f "$recent_tmp" "$history_tmp"
+            miner_warn "Could not read PM2 logs for '$pm2_name'"
+            return 2
+        fi
+        search_files=("$recent_tmp")
+        recent_files=("$recent_tmp")
+    fi
+
+    if grep -a -qiE "Capacity audit miner worker disabled|hot-capacity workspace extension unavailable" "${recent_files[@]}"; then
         miner_fail "Capacity-audit worker disabled in miner logs"
-        echo "$log_text" | grep -iE "Capacity audit miner worker disabled|hot-capacity workspace extension unavailable" | tail -3 | while read -r line; do
+        grep -a -h -iE "Capacity audit miner worker disabled|hot-capacity workspace extension unavailable" "${recent_files[@]}" | tail -3 | while read -r line; do
             miner_info "$line"
         done
         miner_info "Fix: bash scripts/setup_miner.sh && ./miner restart"
+        rm -f "$recent_tmp" "$history_tmp"
         return 1
     fi
 
-    if echo "$log_text" | grep -q "Capacity audit miner worker started"; then
-        worker_line="$(echo "$log_text" | grep "Capacity audit miner worker started" | tail -1)"
+    if grep -a -q "Capacity audit miner worker started" "${search_files[@]}"; then
+        worker_line="$(grep -a -h "Capacity audit miner worker started" "${search_files[@]}" | tail -1)"
         miner_ok "Capacity-audit worker started"
         miner_info "$(echo "$worker_line" | sed 's/^[[:space:]]*//')"
+    elif grep -a -qE "Capacity audit (selected local slot|released hot-start workload|artifacts published|block stream subscribed|preparing hot-start workload)" "${recent_files[@]}"; then
+        activity_line="$(grep -a -h -E "Capacity audit (selected local slot|released hot-start workload|artifacts published|block stream subscribed|preparing hot-start workload)" "${recent_files[@]}" | tail -1)"
+        miner_ok "Capacity-audit worker alive (recent audit activity; startup line aged out)"
+        miner_info "$(echo "$activity_line" | sed 's/^[[:space:]]*//')"
     else
-        miner_fail "No 'Capacity audit miner worker started' line in recent logs"
+        miner_fail "No capacity-audit worker startup or recent audit activity in logs"
         miner_info "Miner may be on old code or still booting — wait 2 min and re-run ./miner check-audit"
+        miner_info "If code was just updated: ./miner restart"
+        rm -f "$recent_tmp" "$history_tmp"
         return 1
     fi
 
-    if echo "$log_text" | grep -q "Capacity audit publish has no validator endpoints"; then
-        miner_fail "Miner logs show no validator audit ingest endpoints"
-        return 1
+    # "no validator endpoints" alone is fatal (discovery empty).
+    # "... slot was not scheduled by known validators" means validators
+    # rejected this audit_id (cohort/schedule mismatch) — warn only.
+    if grep -a -q "Capacity audit publish has no validator endpoints" "${recent_files[@]}"; then
+        if grep -a -q "slot was not scheduled by known validators" "${recent_files[@]}"; then
+            miner_warn "Recent audits were not scheduled by known validators (cohort mismatch)"
+            grep -a -h "slot was not scheduled by known validators" "${recent_files[@]}" | tail -2 | while read -r line; do
+                miner_info "$line"
+            done
+        else
+            miner_fail "Miner logs show no validator audit ingest endpoints"
+            grep -a -h "Capacity audit publish has no validator endpoints" "${recent_files[@]}" | tail -2 | while read -r line; do
+                miner_info "$line"
+            done
+            rm -f "$recent_tmp" "$history_tmp"
+            return 1
+        fi
     fi
 
-    if echo "$log_text" | grep -q "Capacity audit publish error"; then
+    if grep -a -q "Capacity audit publish error" "${recent_files[@]}"; then
         miner_warn "Recent capacity-audit publish transport errors in logs"
-        echo "$log_text" | grep "Capacity audit publish error" | tail -3 | while read -r line; do
+        grep -a -h "Capacity audit publish error" "${recent_files[@]}" | tail -3 | while read -r line; do
             miner_info "$line"
         done
         miner_info "Check outbound firewall to validator ingest ports (usually :8091)"
+        rm -f "$recent_tmp" "$history_tmp"
         return 2
     fi
 
-    if echo "$log_text" | grep -q "Capacity audit artifacts published"; then
-        publish_line="$(echo "$log_text" | grep "Capacity audit artifacts published" | tail -1)"
+    if grep -a -q "Capacity audit artifacts published" "${recent_files[@]}"; then
+        publish_line="$(grep -a -h "Capacity audit artifacts published" "${recent_files[@]}" | tail -1)"
         miner_ok "Recent successful audit receipt publish seen in logs"
         miner_info "$(echo "$publish_line" | sed 's/^[[:space:]]*//')"
     else
         miner_warn "No successful audit publish yet (normal if no audit window since restart)"
     fi
 
+    rm -f "$recent_tmp" "$history_tmp"
     return 0
 }
 
