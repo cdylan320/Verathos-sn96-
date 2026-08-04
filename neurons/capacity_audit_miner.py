@@ -1897,7 +1897,7 @@ class CapacityAuditMinerWorker:
     ) -> int:
         audit_id = str(artifact.get("audit_id") or "")
         artifact_type = str(artifact.get("artifact_type") or "")
-        validator_urls = self._validator_endpoint_urls(force_refresh=False)
+        validator_urls = self._validator_endpoint_urls(nonblocking=True)
         if not validator_urls:
             bt.logging.warning(
                 f"Capacity audit publish has no validator endpoints: "
@@ -2069,10 +2069,19 @@ class CapacityAuditMinerWorker:
             f"audit_id={audit_id[:12]} endpoint={endpoint}"
         )
 
-    def _validator_endpoint_urls(self, *, force_refresh: bool = False) -> tuple[str, ...]:
+    def _validator_endpoint_urls(
+        self,
+        *,
+        force_refresh: bool = False,
+        nonblocking: bool = False,
+    ) -> tuple[str, ...]:
         resolver = getattr(self, "_validator_endpoint_resolver", None)
         if resolver is None:
             return tuple(getattr(self, "validator_urls", ()) or ())
+        if nonblocking:
+            method = getattr(resolver, "current_urls_nonblocking", None)
+            if callable(method):
+                return method()
         return resolver.current_urls(force_refresh=force_refresh)
 
     def _record_validator_publish_result(
