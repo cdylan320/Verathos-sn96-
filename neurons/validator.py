@@ -800,17 +800,39 @@ class ValidatorNeuron:
         self._proof_v3_verdict_source_latched_epoch: int | None = None
         self._owner_verdict_url_latched = ""
         self._verdict_snapshot_hex = ""
+        self._verdict_snapshot_history: Dict[int, str] = {}
         try:
+            from neurons.verdict_records import VerdictSnapshotV1
+
             persisted_snapshot = str(
                 self._db.get_meta("gleipnir_verdict_snapshot_v1") or ""
             )
             if persisted_snapshot:
-                from neurons.verdict_records import VerdictSnapshotV1
-
-                VerdictSnapshotV1.from_bytes(
+                decoded_snapshot = VerdictSnapshotV1.from_bytes(
                     bytes.fromhex(persisted_snapshot)
                 )
                 self._verdict_snapshot_hex = persisted_snapshot
+                self._verdict_snapshot_history[
+                    int(decoded_snapshot.epoch_number)
+                ] = persisted_snapshot
+            persisted_history = str(
+                self._db.get_meta("gleipnir_verdict_snapshots_v1") or ""
+            )
+            if persisted_history:
+                history = json.loads(persisted_history)
+                if not isinstance(history, dict):
+                    raise ValueError("verdict snapshot history must be an object")
+                for raw_epoch, encoded in history.items():
+                    epoch = int(raw_epoch)
+                    if epoch < 0 or not isinstance(encoded, str):
+                        raise ValueError("verdict snapshot history is malformed")
+                    decoded = VerdictSnapshotV1.from_bytes(bytes.fromhex(encoded))
+                    if int(decoded.epoch_number) != epoch:
+                        raise ValueError("verdict snapshot history epoch mismatch")
+                    self._verdict_snapshot_history[epoch] = encoded
+                self._verdict_snapshot_history = dict(
+                    sorted(self._verdict_snapshot_history.items())[-4:]
+                )
         except Exception as exc:
             bt.logging.warning(
                 "Ignoring malformed persisted verdict snapshot: "
@@ -3870,6 +3892,41 @@ class ValidatorNeuron:
                 "capacity_audit": True,
                 "protocol_version": PROTOCOL_VERSION,
             }
+
+        @app.get("/v1/verdicts/current")
+        async def _verdict_snapshot(epoch: int | None = None):
+            """Serve owner-signed bytes directly from the owner validator."""
+
+            if not _proof_v3_hard_auditor_active(
+                self.config,
+                getattr(self, "_validator_hotkey_ss58", ""),
+            ):
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "verdict snapshot unavailable"},
+                    headers={"Cache-Control": "no-store", "Retry-After": "15"},
+                )
+            snapshot = (
+                (getattr(self, "_verdict_snapshot_history", {}) or {}).get(
+                    int(epoch),
+                    "",
+                )
+                if epoch is not None
+                else str(getattr(self, "_verdict_snapshot_hex", "") or "")
+            )
+            if not snapshot:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "verdict snapshot unavailable",
+                        **({"epoch": int(epoch)} if epoch is not None else {}),
+                    },
+                    headers={"Cache-Control": "no-store", "Retry-After": "15"},
+                )
+            return JSONResponse(
+                content={"snapshot": snapshot},
+                headers={"Cache-Control": "public, max-age=15"},
+            )
 
         async def _receipt(request):
             read_status, payload, received_at = await _read_payload(request)
@@ -11552,6 +11609,18 @@ class ValidatorNeuron:
         )
         encoded = snapshot.to_bytes().hex()
         self._db.set_meta("gleipnir_verdict_snapshot_v1", encoded)
+        history = dict(getattr(self, "_verdict_snapshot_history", {}) or {})
+        history[int(epoch_number)] = encoded
+        history = dict(sorted(history.items())[-4:])
+        self._db.set_meta(
+            "gleipnir_verdict_snapshots_v1",
+            json.dumps(
+                {str(epoch): value for epoch, value in history.items()},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        self._verdict_snapshot_history = history
         self._verdict_snapshot_hex = encoded
         bt.logging.info(
             f"VerdictSnapshotV1 finalized: epoch={epoch_number} "
@@ -11682,6 +11751,19 @@ class ValidatorNeuron:
                 getattr(self, "_validator_hotkey_ss58", ""),
             )
             else ""
+        )
+        shared.verdict_snapshots = (
+            {
+                str(epoch): str(snapshot)
+                for epoch, snapshot in (
+                    getattr(self, "_verdict_snapshot_history", {}) or {}
+                ).items()
+            }
+            if _proof_v3_hard_auditor_active(
+                self.config,
+                getattr(self, "_validator_hotkey_ss58", ""),
+            )
+            else {}
         )
         # Build ss58_map with UIDs so the proxy can resolve UIDs for
         # miners not in miner_endpoints (e.g. inactive/unreachable).

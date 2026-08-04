@@ -18,7 +18,7 @@ class VerdictSnapshotUnavailable(RuntimeError):
     """The owner feed could not supply an acceptable current snapshot."""
 
 
-def verdict_snapshot_url(owner_url: str) -> str:
+def verdict_snapshot_url(owner_url: str, *, epoch: int | None = None) -> str:
     value = str(owner_url or "").strip().rstrip("/")
     parsed = urlparse(value)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -26,8 +26,14 @@ def verdict_snapshot_url(owner_url: str) -> str:
     if parsed.query or parsed.fragment:
         raise ValueError("owner verdict URL cannot include query or fragment data")
     if parsed.path.rstrip("/").endswith("/v1/verdicts/current"):
-        return value
-    return value + "/v1/verdicts/current"
+        base = value
+    else:
+        base = value + "/v1/verdicts/current"
+    if epoch is None:
+        return base
+    if type(epoch) is not int or epoch < 0:
+        raise ValueError("verdict snapshot epoch must be a non-negative integer")
+    return f"{base}?epoch={epoch}"
 
 
 def owner_has_validator_permit(owner_hotkey_ss58: str, metagraph: object) -> bool:
@@ -138,7 +144,7 @@ class VerdictSnapshotFollower:
         timeout: float = 10.0,
         now: int | None = None,
     ) -> VerdictSnapshotV1:
-        url = verdict_snapshot_url(owner_url)
+        url = verdict_snapshot_url(owner_url, epoch=int(closing_epoch))
         try:
             response = httpx.get(
                 url,
