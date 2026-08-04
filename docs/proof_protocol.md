@@ -1,616 +1,416 @@
-# Proof Protocol Whitepaper
+# Proof Protocol v2
 
-Protocol version: Verifiable inference proof line, July 6, 2026.
+Protocol version: 2.
 
-This document specifies the proof protocol used by Verathos validators to verify
-LLM inference from remote miners without downloading the model or running a GPU.
-It is written as a citable technical description of the production proof line.
-Operational scoring and hot-capacity audits are separate systems that build on
-this verification layer.
+Verathos proof v2 is a probabilistic, response-bound audit for dense vLLM
+inference. It gives validators cryptographically sound checks for selected
+registered matrix operations without requiring validators to download model
+weights or run the model.
 
-## Abstract
+The protocol does not claim that every transformer operation is proven on every
+request. It commits a complete captured decode-time projection shell and proves
+an unpredictable subset of its authenticated runtime claims. Repeated requests,
+canaries, probation, and hot-capacity audits are complementary controls; they do
+not turn an unproven execution link into a cryptographic proof. The candidate is
+not release-qualified for a general economic model-substitution claim until its
+adversarial substitute-execution benchmark passes.
 
-Verathos uses a non-interactive probabilistic proof protocol for neural
-inference. A miner serves an LLM response, commits to the prompt, generated token
-IDs, model activations, and decode metadata, then derives verifier challenges
-with Fiat-Shamir from a validator nonce and the miner commitment. The proof
-opens a random subset of transformer layers, GEMM operations, matrix blocks,
-input embedding rows, decode positions, and MoE router decisions. Each opened
-operation is checked against on-chain model commitments with Merkle paths and
-sumcheck proofs over an integer field.
+## Security scope
 
-The validator verifies the proof on CPU. It does not need model weights, a GPU,
-or private state. A failed proof makes the receipt invalid and enters the
-subnet's scoring and probation logic.
-
-## Goals
-
-The protocol is designed for a permissionless inference subnet with adversarial
-miners and lightweight validators.
-
-It provides:
-
-- Weight binding: the miner must use the model weights registered on-chain.
-- Prompt binding: the proof is tied to the validator's request.
-- Decode binding: the returned token IDs are committed into the transcript.
-- Compute binding: challenged linear operations are proven as matrix products.
-- Sampling binding: generation parameters and sampled decode positions are
-  bound to the commitment.
-- Lightweight verification: validators verify with Merkle roots and CPU work.
-- Cumulative security: repeated independent requests drive detection
-  probability toward one.
-
-It does not try to prove every floating-point operation of every token in every
-request. Instead, it combines cryptographic spot verification with economic
-penalties and validator-controlled canaries. This keeps serving practical on
-commodity GPUs while making cheaper-than-honest serving unprofitable.
-
-## Actors
-
-**Subnet owner.** Registers supported models and their verification metadata.
-
-**Miner.** Runs the model, serves inference, builds commitments, and produces
-proof bundles.
-
-**Validator.** Sends requests and nonces, verifies proof bundles, signs
-receipts, scores miners, and applies probation/zero-score policy.
-
-**User or proxy.** Sends OpenAI-compatible chat requests through a validator or
-gateway. The user-facing API does not need to know proof internals.
-
-## Public Model Commitments
-
-Each supported model has a public `ModelSpec` anchored on-chain. The exact
-schema can evolve, but the verification trust anchor contains these fields:
-
-- `model_id`, architecture, layer count, dimensions, vocabulary size, context
-  length, and quantization mode.
-- Overall model weight commitment.
-- Per-layer or hierarchical layer weight roots.
-- Flat chunk Merkle roots for lightweight per-weight openings.
-- Embedding weight root for input-token binding.
-- `lm_head` weight root for decode/sampling verification.
-- Tokenizer and chat-template hash.
-- MoE router and expert roots for mixture-of-experts models.
-- Quantization/proof metadata needed to map served weights into the proof
-  integer domain.
-
-The subnet owner computes these roots from the canonical artifacts. Miners
-cannot choose their own roots for a registered model. Validators read the roots
-from chain and use them as the verification anchor.
-
-## Proof Line
-
-At a high level, every verified inference follows this line:
+For every selected proof-v2 block, the verifier checks a statement of the form:
 
 ```text
-request + validator_nonce
-  -> miner inference
-  -> inference commitment
-  -> beacon = H(commitment_hash, validator_nonce)
-  -> Fiat-Shamir challenges
-  -> proof bundle
-  -> validator verification
-  -> signed receipt
-  -> scoring / routing / probation
+captured runtime X × authenticated registered W = captured runtime Y
 ```
 
-There is no challenge-response round trip after inference. The validator sends a
-fresh nonce with the request. The miner cannot know the final challenge set until
-after it has committed to the inference trace.
+The selected statement is bound to:
 
-## Request Binding
+- the validator request and prompt hash
+- the exact on-chain `ModelSpec`
+- an authority-signed proof-v2 weight manifest
+- the complete pre-challenge X/runtime-Y commitment set
+- output token IDs and decode metadata
+- a validator nonce revealed only after the commitment is frozen
+- exact operation identities, dimensions, blocks, and transcript rounds
 
-For each request the validator sends:
+A valid selected opening cannot use substituted weights, change X or Y after
+challenge selection, omit a challenged operation, or choose its own dimensions
+or block coordinates.
 
-- prompt or canonical chat messages
-- generation parameters
-- sampling verification rate
-- requested maximum output length
-- a fresh 32-byte `validator_nonce`
+Before challenge selection, the miner commits a decode trace for every
+supported row. A commitment alone does not establish that the trace or its
+state was produced by the registered model. The light tier leaves the trace
+sealed and proves only its selected registered equations. A successful light
+proof therefore does not, by itself, establish that those equations produced
+the returned token.
 
-The miner canonicalizes the prompt with the model's tokenizer/chat template and
-computes:
+On a nonce-selected hard audit, the verifier opens one transcript-selected
+generated decode row across every model layer and requires its residual
+boundaries to form one ordered corridor. Separately, it proves all registered
+linear families only in the stratified transcript-selected layers, at the
+authority-signed number of blocks per operation. Nonlinear attention/GDN replay
+is likewise limited to the selected transition layers. The verifier replays the
+signed RMSNorm, residual, and SiLU bridges where the selected witnesses require
+them, and binds the corridor row through final normalization, LM head, sampler,
+and returned token.
 
-$$
-\mathrm{prompt\_hash}
-= \operatorname{SHA256}(\mathrm{canonical\_prompt\_or\_message\_json})
-$$
+The hard tier also verifies independently replayed, nonce-selected attention
+transitions. Before the nonce, every decode-suffix row separately commits a
+compact transition witness: GDN commits its replay inputs and state digests;
+full attention commits a Merkle root over every logical query head's Q/K/V and
+core output. For full attention, the proof opens the precommitted logical K/V
+prefix for each selected K/V head plus the selected compact head witnesses,
+applies the signed RoPE/GQA causal replay, and matches the selected
+attention-core head output. The signed full-attention profile requires at least
+two selected query heads per selected layer. For GDN, it opens the captured
+prompt boundary and replays the generated decode suffix through the signed
+state transition.
 
-The miner also commits generation parameters:
+These checks make a prover-authored attention-state hash chain insufficient for
+the selected witnesses. They do not establish that the opened corridor, its
+post-prefill cache boundary, or unselected operations were produced by the
+registered model. A sparse synthetic corridor or self-consistent fabricated
+post-prefill state remains an adversarial-release test, not a solved
+cryptographic claim. The raw full-attention K/V opening is a bounded reference
+adapter, not a qualified 250k- or 1m-context proof path; requests outside its
+qualified trace and payload limits must fail closed rather than silently fall
+back to a hard success.
 
-$$
-\begin{aligned}
-\mathrm{sampler\_config\_hash}
-= \operatorname{SHA256}(&\text{"SAMPLER\_CONFIG\_V2"} \,\Vert\,
-\mathrm{top\_k} \,\Vert\, \mathrm{top\_p} \,\Vert\, \mathrm{min\_p} \,\Vert\\
-&\mathrm{presence\_penalty})
-\end{aligned}
-$$
+The current vLLM cache ABI starts at the final prompt-token row, so a one-token
+response has no independently replayable decode suffix. If the post-commitment
+hard draw selects such a response, it fails verification; it is never relabeled
+as a successful light audit.
 
-The validator recomputes the expected hashes from the request it sent. A mismatch
-rejects the proof.
+## Trust anchors
 
-## Inference Commitment
+### On-chain ModelSpec
 
-During inference the miner records enough data to bind the served response to an
-execution trace:
+Validators load the registered model identity and metadata from chain,
+including model ID, dimensions, quantization identity, canonical model roots,
+tokenizer metadata, and other registration fields.
 
-- session and model identity
-- model weight commitment
-- input commitment
-- output token commitment
-- per-layer activation commitments
-- embedding output commitment
-- layer transition hashes
+The existing on-chain Merkle roots are not recalculated per request and are not
+used as the polynomial-commitment transcript.
+
+### Signed proof-v2 manifest
+
+Each supported model also has an authority-signed manifest containing the exact
+proof-v2 polynomial commitments for:
+
+- every fused MLP gate/up and down projection
+- every full-attention QKV and output projection
+- every GDN QKVZ, BA, and output projection
+- the model-level `model.lm_head` operation
+- the registered embedding and final-normalization boundary
+- the exact per-layer RMSNorm parameters and attention profile
+- the authority-signed hard-audit policy, including rate, stratification,
+  selected-head requirements, and block coverage per operation
+
+The manifest binds the commitments to the on-chain `ModelSpec`, operation
+identities, dimensions, quantization/encoding parameters, tolerances, and
+commitment-generator version. Validators reject a manifest whose signature or
+model identity does not match the configured authority and live chain data.
+
+Validators download only the signed manifest. Miners additionally download the
+matching static weight catalog needed to construct openings. Artifacts are
+content-addressed, hash-checked, cached locally, and may be served from the
+configured HTTPS artifact store.
+
+The catalog contains commitments, not a second copy of the model. After the
+nonce selects a block, a miner reconstructs only that exact 16-column W witness
+from its local checkpoint and checks the derived scale against the signed
+manifest before proving it. This work is proportional to the selected proof
+blocks, not to all model weights.
+
+The protocol format is extensible, but the current execution-adapter candidate
+is narrower: it targets the dense Qwen3.5/Qwen3.6 hybrid profile in the grouped
+signed-INT4 `compressed-tensors` checkpoint layout, including its FP16
+projections. It is not release-qualified until its real vLLM E2E and
+performance gates pass. FP16/BF16-only, other GPTQ/AWQ layouts, FP8, NVFP4,
+MoE, and other model families require their own qualified adapter and signed
+manifest. Unsupported combinations fail closed.
+
+## Network flow
+
+Proof v2 uses one inference stream plus one small nonce-reveal request. The
+reveal is necessary because the miner must freeze the commitment before learning
+the sampling entropy.
+
+```mermaid
+sequenceDiagram
+    participant V as Validator or proxy
+    participant M as Miner
+
+    V->>V: Generate nonce n and request ID q
+    V->>M: POST /chat with q and H(n, q)
+    M-->>V: Stream every generated text token immediately
+    M->>M: Freeze output, X, runtime-Y, and decode commitments
+    M-->>V: SSE proof_precommit(H(C), session, q)
+    V->>V: Record the frozen commitment digest
+    V->>M: POST /proof/v2/challenge with n, q, and H(C)
+    M-->>V: SSE proof_commitment(C)
+    M->>M: Derive challenges and generate proof
+    M-->>V: SSE done(proof payload, timing)
+    V->>V: Replay transcript and verify
+```
+
+The final text token is not buffered behind proof generation. The SSE
+connection remains open for the proof event after normal token streaming.
+Miner and validator measure a one-second last-text-token-to-proof-event
+performance target. Missing that target is telemetry, not a proof-validity
+failure; a valid proof remains valid regardless of response latency.
+
+## Request and nonce commitment
+
+The validator generates:
+
+- a fresh 32-byte nonce `n`
+- a fresh 32-byte proof challenge ID `q`
+- `nonce_commitment = H(domain || n || q)`
+
+The initial inference request contains `q` and `nonce_commitment`, but not `n`.
+The miner cannot derive the final challenge set from the initial request.
+
+After receiving `proof_precommit`, the validator sends `n` to the authenticated
+challenge endpoint together with `q`, the session ID, and the commitment hash.
+The miner verifies the nonce commitment and accepts exactly one idempotent reveal
+for the frozen session. The miner streams the full commitment immediately after
+the digest event, allowing its transfer to overlap the reveal and proof work.
+It must hash to the pre-challenge digest before its proof can be accepted.
+
+## Pre-challenge inference commitment
+
+For the current dense runtime, the miner commits every generated decode row for
+every registered layer operation before challenge selection:
+
+- quantized `X` commitments for the exact projection set
+- captured runtime `Y` block commitments for the same operations
+- a per-token causal trace root containing all layer boundaries
+
+The miner also commits:
+
+- model and session identity
+- input-token hash and prompt hash
+- output-token hash and exact output count
+- sampler configuration and sampling-verification rate
+- greedy or sampled decode mode
 - decode hidden-row root
-- optional decode logits-row root for high-assurance sampling checks
-- output token count
-- `do_sample`, temperature, and sampling verification rate
-- prompt hash
-- sampler config hash
-- optional sampling seed commitment
-- optional MoE router commitment hash
-
-The generated token IDs are committed as:
-
-$$
-\mathrm{output\_commitment}
-= \operatorname{SHA256}(\operatorname{int64\_le}(\mathrm{output\_token\_ids}))
-$$
-
-The full inference commitment serializes these fields with domain separators.
-The commitment hash is:
-
-$$
-C = \operatorname{SHA256}(\operatorname{serialize}(\mathrm{InferenceCommitment}))
-$$
-
-The validator later checks that the proof bundle's `output_token_ids` match
-`output_commitment`, so the miner cannot prove one output and return another.
-
-## Beacon
-
-The beacon is derived from the miner commitment and the validator nonce:
-
-$$
-\mathrm{beacon}
-= \operatorname{SHA256}(\text{"VERILLM\_BEACON\_V2"} \,\Vert\, C \,\Vert\,
-\mathrm{validator\_nonce})
-$$
-
-Security depends on two facts:
-
-1. The validator nonce is fixed before inference and unpredictable to the miner.
-2. The commitment depends on the actual inference trace.
-
-The miner cannot choose a favorable challenge set unless it can also construct a
-valid commitment and proofs for the chosen output.
-
-## Challenge Derivation
-
-All challenges are deterministic functions of the beacon and commitment. The
-validator recomputes them independently.
-
-For dense transformer layers:
-
-$$
-\begin{aligned}
-\mathrm{challenge\_seed}
-= \operatorname{SHA256}(&\text{"VERILLM\_CHALLENGE\_V1"} \,\Vert\,
-\mathrm{beacon} \,\Vert\, \mathrm{model\_commitment} \,\Vert\\
-&\mathrm{input\_commitment} \,\Vert\, \mathrm{output\_commitment} \,\Vert\,
-\mathrm{layer\_commitments})
-\end{aligned}
-$$
-
-The challenge samples:
-
-- `k_layers` unique transformer layers.
-- `k_gemms_per_layer` GEMM operations inside each challenged layer.
-- `k_blocks_per_gemm` matrix-output blocks inside each challenged GEMM.
-- Fiat-Shamir-derived spot positions inside each opened block.
-
-Current implementation defaults use an auto layer rate targeting roughly 6.25%
-per-request layer coverage, with at least one layer and a cap at half the model.
-For a 64-layer dense model this yields 4 challenged layers. The proof line is
-parameterized; validators can increase challenge rates for canaries or future
-policy.
-
-## GEMM Proof
-
-The core arithmetic proof verifies a challenged matrix multiplication:
-
-$$
-Y = XW
-$$
-
-where:
-
-- `X` is a committed activation block.
-- `W` is a committed weight block rooted in the on-chain `ModelSpec`.
-- `Y` is the committed output block for that operation.
-
-The proof operates over the Mersenne prime field:
-
-$$
-p = 2^{61} - 1
-$$
-
-Floating or quantized serving formats are mapped into an integer proof domain.
-INT8/INT4/FP8/MXFP4 paths all resolve to deterministic integer representations
-for proof generation, avoiding floating-point nondeterminism in verification.
-
-For a challenged output block, write:
-
-$$
-X_{\mathrm{block}} \in \mathbb{F}^{m \times K}, \qquad
-W_{\mathrm{block}} \in \mathbb{F}^{K \times n}, \qquad
-Y_{\mathrm{block}} \in \mathbb{F}^{m \times n}.
-$$
-
-where `m` and `n` are the output block dimensions and `K` is the inner model
-dimension. The tensors are padded to powers of two. Let:
-
-$$
-\ell_m = \lceil \log_2 m \rceil,\qquad
-\ell_n = \lceil \log_2 n \rceil,\qquad
-\ell_K = \lceil \log_2 K \rceil.
-$$
-
-$$
-\widetilde{X}: \mathbb{F}^{\ell_m + \ell_K} \to \mathbb{F},\qquad
-\widetilde{W}: \mathbb{F}^{\ell_K + \ell_n} \to \mathbb{F},\qquad
-\widetilde{Y}: \mathbb{F}^{\ell_m + \ell_n} \to \mathbb{F}
-$$
-
-be the multilinear extensions of the padded tables. The verifier derives random
-row/column points `r_i` and `r_j` from the transcript and checks:
-
-$$
-\widetilde{Y}(r_i, r_j)
-= \sum_{z \in \{0,1\}^{\ell_K}}
-\widetilde{X}(r_i, z)\,\widetilde{W}(z, r_j)
-$$
-
-The right side is a Boolean-hypercube sum of the polynomial:
-
-$$
-g(z) = \widetilde{X}(r_i, z)\,\widetilde{W}(z, r_j)
-$$
-
-`g` has degree at most 2 in each variable because it is the product of two
-multilinear polynomials. This is exactly the setting where the sumcheck
-protocol is efficient: the verifier checks a length-`K` inner product with only
-`logK` rounds and constant-size work per round.
-
-For each challenged block the miner sends:
-
-- the output block Merkle path under the `Y` root
-- a sumcheck transcript proving the multilinear extension identity for `X * W`
-- the prover's final `A` and `B` field evaluations
-- Merkle-opened spot checks for `X`
-- Merkle-opened spot checks for `W`
-
-The verifier checks:
-
-1. The output block leaf belongs to the committed `Y` root.
-2. The sumcheck transcript is valid under the verifier's Fiat-Shamir transcript.
-3. The final claim equals `final_A * final_B` in the proof field.
-4. Opened `X` values belong to the per-request activation commitment.
-5. Opened `W` values belong to the on-chain weight Merkle root.
-
-In lightweight mode, validators never hold the full model. Weight checks are
-done only through Merkle openings against on-chain roots.
-
-## Sumcheck Protocol
-
-The sumcheck subprotocol proves a claim of the form:
-
-$$
-S = \sum_{z \in \{0,1\}^{\ell}} g(z)
-$$
-
-where $\ell = \lceil \log_2 K \rceil$. In the GEMM proof, $S$ is the
-multilinear evaluation $\widetilde{Y}(r_i, r_j)$ and
-$g(z) = \widetilde{X}(r_i,z)\,\widetilde{W}(z,r_j)$.
-
-At round `t`, the prover sends three field elements:
-
-$$
-h_t(0),\quad h_t(1),\quad h_t(2)
-$$
-
-These define a degree-2 univariate polynomial:
-
-$$
-h_t(u)
-= \sum_{z_{t+1},\ldots,z_{\ell} \in \{0,1\}}
-g(r_1,\ldots,r_{t-1},u,z_{t+1},\ldots,z_{\ell})
-$$
-
-The verifier checks:
-
-$$
-h_t(0) + h_t(1) = \mathrm{current\_claim}
-$$
-
-Then it derives the next challenge:
-
-$$
-r_t =
-H(\mathrm{transcript} \,\Vert\, h_t(0) \,\Vert\, h_t(1) \,\Vert\, h_t(2))
-$$
-
-and updates:
-
-$$
-\mathrm{current\_claim} = h_t(r_t)
-$$
-
-where `h_t(r_t)` is reconstructed from `h_t(0)`, `h_t(1)`, and `h_t(2)` by
-degree-2 interpolation. After $\ell$ rounds the verifier checks the final reduced
-claim:
-
-$$
-\mathrm{current\_claim} = \mathrm{final\_A} \cdot \mathrm{final\_B}
-$$
-
-where `final_A` and `final_B` are the prover's final folded evaluations of the
-$\widetilde{X}(r_i,z)$ and $\widetilde{W}(z,r_j)$ tables at the Fiat-Shamir
-point $(r_1,\ldots,r_{\ell})$.
-
-### Soundness
-
-If the prover's polynomial is wrong, the equality checked in some round becomes
-a non-zero low-degree polynomial identity. By the Schwartz-Zippel lemma, a
-non-zero degree-$d$ polynomial over $\mathbb{F}_p$ evaluates to zero at a
-random point with probability at most $d/p$.
-
-Here each sumcheck round uses degree at most 2, so the arithmetic soundness error
-for one $\ell$-round GEMM block is bounded by approximately:
-
-$$
-\varepsilon_{\mathrm{sumcheck}} \le \frac{2\ell}{p}
-$$
-
-With $p = 2^{61} - 1$, even $\ell = 16$ gives:
-
-$$
-\varepsilon_{\mathrm{sumcheck}}
-\le \frac{32}{2^{61}-1}
-\approx 1.4 \times 10^{-17}
-$$
-
-This is the soundness of the arithmetic reduction once the challenged layer,
-GEMM, and block have been selected. The separate probabilistic part is the
-sampling of which layers, GEMMs, blocks, decode positions, and spot openings are
-audited for a request.
-
-The Merkle openings are what bind the algebraic tables to the committed
-inference trace:
-
-- `Y` block openings bind the claimed output block to the `Y` root.
-- `X` spot openings bind activation values to the per-request activation root.
-- `W` spot openings bind weight values to the on-chain model root.
-
-So the proof is not only "there exists some matrix product"; it is a matrix
-product tied to the committed request trace and registered model weights at
-unpredictable positions chosen after the commitment is fixed.
-
-## Activation and Layer Binding
-
-Each transformer layer emits an activation commitment. Challenged GEMM proofs
-open `X` values under the layer's activation root. Layer transition hashes bind
-neighboring layer commitments and the embedding output root into the inference
-commitment.
-
-This prevents a miner from presenting unrelated witness tensors for the
-challenged operation: the opened activation values must match the same
-commitment that determines the beacon and challenge set.
-
-## Input Binding
-
-Prompt substitution is prevented by three linked checks:
-
-1. The validator recomputes `prompt_hash`.
-2. The miner opens sampled input token positions against the embedding weight
-   root.
-3. The embedding output root is tied into the layer transition hash chain.
-
-The embedding challenge is derived as:
-
-$$
-\operatorname{SHA256}(\text{"VERILLM\_EMBEDDING\_CHALLENGE\_V1"}
-\,\Vert\, \mathrm{beacon}
-\,\Vert\, \mathrm{input\_commitment}
-\,\Vert\, \mathrm{num\_input\_tokens})
-$$
-
-Production validators sample up to five input token positions per proof. This
-binds the prompt/token IDs to the first model activation without requiring the
-validator to run the embedding layer for the full prompt.
-
-## Decode and Sampling Binding
-
-The proof commits to generated token IDs, output length, decoding mode, and
-sampling parameters. The validator checks:
-
-- `output_token_ids` hash to `output_commitment`
-- `output_token_count` matches the number of committed token IDs
-- `do_sample` and temperature match validator expectations when required
-- `sampler_config_hash` matches requested generation parameters
-
-For decode-integrity verification, a Fiat-Shamir gate decides whether the
-request includes a sampling challenge:
-
-$$
-\operatorname{SHA256}(\text{"VERILLM\_SAMPLING\_GATE\_V1"} \,\Vert\,
-\mathrm{beacon})
-$$
-
-If active, the challenge samples output positions from:
-
-$$
-\operatorname{SHA256}(\text{"VERILLM\_SAMPLING\_CHALLENGE\_V1"} \,\Vert\,
-\mathrm{beacon} \,\Vert\, \mathrm{decode\_hidden\_row\_root} \,\Vert\,
-\mathrm{output\_commitment} \,\Vert\, \mathrm{vocab\_size})
-$$
-
-At each challenged decode position the miner opens:
-
-- hidden row under `decode_hidden_row_root`
-- optional fp16 logits row under `decode_logits_row_root`
-- `lm_head` weight root
-- `lm_head` GEMM proof for the opened row
-- committed token ID for that decode step
-
-For greedy decoding (`temperature=0`), the verifier checks that the committed
-token is the argmax of the proven logits when strict mode applies. For sampled
-decoding, the miner can commit a sampling seed before inference; the validator
-replays the canonical sampler on opened logits and checks the chosen token.
-
-Decode checks are sampled because proving every `lm_head` row for every output
-token would dominate inference cost. Validator canaries can raise the sampling
-rate when higher assurance is needed.
-
-## MoE Proofs
-
-Mixture-of-experts models add router and expert commitments.
-
-For each challenged MoE layer, the challenge samples token positions and expert
-openings. The proof verifies:
-
-- router commitment hash matches the inference commitment
-- selected experts match opened router rows
-- expert roots hash into the registered layer root
-- selected expert GEMMs prove their gate/up/down projections
-- shared experts, when present, are challenged independently
-
-The validator does not need all expert weights. It verifies expert weight spots
-through Merkle openings rooted in the `ModelSpec`.
-
-## Verification Algorithm
-
-Validator verification is deterministic:
+- canonical top-k logits-row root when decode auditing can be selected
+- signed manifest digest
+
+The trace starts at the authenticated embedding of the final prompt token used
+to produce the first returned token, then follows every returned decode step.
+The complete prompt token sequence and prompt hash are committed. The runtime
+also freezes the attention/GDN state at the final-prompt boundary before the
+nonce. Hard verification replays selected generated-suffix transitions from
+that boundary, but it does not independently recompute arbitrary earlier
+prefill positions or prove the origin of the committed post-prefill cache.
+
+The v2 verifier rejects legacy layer commitments and
+`layer_transition_hashes`. Those fields did not prove a transformer transition
+and are not part of the v2 security claim.
+
+## Challenge derivation
+
+After nonce reveal, both parties derive a transcript state from:
 
 ```text
-verify(request, response, proof_bundle):
-  load ModelSpec(model_id) from chain
-  recompute prompt_hash and sampler_config_hash
-  check output_token_ids hash to output_commitment
-  C = SHA256(serialize(commitment))
-  beacon = SHA256("VERILLM_BEACON_V2" || C || validator_nonce)
-  derive dense or MoE challenges
-  verify embedding proof if active
-  for each challenged layer:
-      for each challenged GEMM:
-          verify Y Merkle opening
-          verify sumcheck transcript
-          verify final field claim
-          verify X Merkle spots
-          verify W Merkle spots against on-chain root
-  verify MoE router/expert openings if active
-  verify decode/sampling openings if active
-  accept only if every check passes
+validator nonce
+signed manifest digest
+canonical all-layer X/runtime-Y commitment envelope
+model and request identity
+prompt/input commitments
+sampler policy
 ```
 
-An accepted proof produces a signed validator receipt containing the commitment
-hash, proof result, locally measured timing metrics, and token counts. A failed
-proof is not counted as valid work.
+The exact registered operation universe comes from the signed manifest, not
+from miner-provided layer counts or labels.
 
-## Detection Probability
+Current dense defaults target approximately 6.25% layer coverage:
 
-For a miner cheating in a specific transformer layer, detection probability per
-request is dominated by whether that layer is challenged:
+| Model layers | Selected layers |
+|---:|---:|
+| 32 | 2 |
+| 64 | 4 |
+| 80 | 5 |
 
-$$
-P_{\mathrm{detect}}^{(1)}
-= \frac{k_{\mathrm{layers}}}{N_{\mathrm{layers}}}
-$$
+The light tier selects one registered operation in each selected layer and
+leaves the causal trace sealed. The hard tier selects every registered
+operation in each stratified selected layer, opens the full residual corridor
+for one derived decode row, opens the exact selected causal transitions, and
+adds the transcript-selected LM-head/decode audit. Each selected hard operation
+opens the authority-signed number of blocks, bounded by its available block
+count. The verifier requires the received proof descriptors and trace tier to
+equal the derived challenge exactly: no omissions, additions, duplicates,
+alternate dimensions, or miner-selected trace openings.
 
-After $M$ independent proof requests:
+If a defect necessarily invalidates every registered operation in one layer and
+the sampled witnesses are causally meaningful for that defect, the hard-tier
+cumulative challenge probability is:
 
-$$
-P_{\mathrm{detect}}^{(M)}
-= 1 - \left(1 - \frac{k_{\mathrm{layers}}}{N_{\mathrm{layers}}}\right)^M
-$$
+```text
+P(caught after m requests) = 1 - (1 - k/N)^m
+```
 
-Examples:
+At `k/N = 6.25%`, the probability is about 48% after 10 hard audits, 90% after
+36, and 99% after 72. This is a conditional layer-local calculation, not a
+general model-substitution pass-rate bound. A defect confined to one operation
+has a lower light-tier rate because the operation is also sampled within its
+layer. Detection figures must therefore use the exact light/hard policy and
+the affected operation set, then be checked against the substitute-execution
+benchmark.
 
-| Layers | Challenged | One request | 36 requests | 72 requests |
-|---:|---:|---:|---:|---:|
-| 32 | 2 | 6.25% | 90.2% | 99.0% |
-| 64 | 4 | 6.25% | 90.2% | 99.0% |
-| 80 | 5 | 6.25% | 90.2% | 99.0% |
+## Batched sumcheck and IPA openings
 
-If the miner serves the wrong model, many or all layer weights differ, so any
-challenged layer reveals the mismatch. If the miner corrupts only a small part
-of a single layer, detection is still cumulative across independent requests.
+The arithmetic statement is reduced with a transcript-bound batched sumcheck.
+Terminal evaluations are authenticated with polynomial-commitment openings;
+they are not accepted as unauthenticated prover scalars.
 
-## Security Assumptions
+Proof v2 uses the Pallas scalar field and Pedersen/IPA polynomial commitments,
+providing an approximately 128-bit security target. The verifier checks:
 
-The protocol assumes:
+1. the exact challenge descriptor and transcript
+2. the committed X row opening
+3. the signed-manifest W opening
+4. the committed runtime-Y segment opening
+5. the batched sumcheck identity
+6. the terminal IPA evaluation openings
+7. runtime-Y agreement within manifest-bounded quantization tolerance
 
-- SHA-256 is collision resistant.
-- Merkle paths bind leaves to published roots.
-- Fiat-Shamir challenges are unpredictable before the commitment is fixed.
-- The sumcheck protocol is sound over the selected field.
-- Validators generate fresh nonces and verify against the correct on-chain
-  `ModelSpec`.
-- The canonical tokenizer/chat-template hash used by validators matches the
-  registered model metadata.
+The proof engine batches selected layer blocks and, when active, the hardened
+LM-head audit into the same native proof path.
 
-The protocol is probabilistic, not a full SNARK of every operation. Its security
-comes from unpredictable challenge sampling plus economic penalties for failed
-proofs.
+## Decode and LM-head audit
 
-## Operational Controls
+`sampling_verification_bps` is caller-visible request sampling for the ordinary
+decode audit; it is committed into the transcript. It is not the hard-execution
+policy. In particular, setting it to `10000` neither forces a hard audit nor
+reveals whether the hard tier will be selected. The hard tier is selected only
+from the post-commitment nonce and the authority-signed `hard_audit_bps`.
 
-The proof protocol is one layer of the subnet's integrity system. Validators
-also use:
+For ordinary decode sampling, `sampling_verification_bps` controls whether the
+response receives the additional decode audit:
 
-- canary prompts with forced proof requests
-- full-context canaries
-- decoded-output sanity checks
-- receipt-level timing and throughput checks measured by the validator
-- probation and score-zeroing after failures
-- hot-capacity audits for real hardware capacity under load
+- `0`: no decode audit
+- `1000`: approximately 10% of eligible requests
+- `10000`: every eligible request
 
-These controls cover behavior that is not purely an arithmetic proof question:
-serving availability, response completeness, malformed output, shared-capacity
-endpoints, or routing quality.
+Public organic traffic currently requests `1000`. Canary traffic requests
+`10000`.
 
-## What Is Publicly Verifiable
+When the ordinary Fiat-Shamir decode gate selects the audit, the challenge
+chooses:
 
-Given a proof bundle, validator nonce, response token IDs, and chain `ModelSpec`,
-a third party can verify:
+- one output position for responses up to 1024 tokens
+- two positions up to 4096 tokens
+- three positions above 4096 tokens
 
-- the beacon was derived correctly
-- the challenge set was derived correctly
-- opened weights match registered roots
-- opened activations match the miner's commitment
-- challenged matrix multiplications are valid
-- output token IDs match the commitment
-- sampled decode checks match the committed tokens
+For every selected position, the miner opens the committed hidden row and
+canonical top-k logits row. The verifier checks the exact output token history
+and either:
 
-They cannot infer private user prompts beyond what is present in the request,
-and they do not need private validator state.
+- greedy decoding, including the committed presence-penalty policy; or
+- canonical seeded sampling replay for supported sampled requests
 
-## Summary
+One of the selected positions also carries the hardened LM-head PCS audit. The
+validator derives four vocabulary blocks after the response commitment is
+frozen. The set includes the returned token's block and the committed top
+token's block, then samples additional top-k/outside blocks subject to the PCS
+term budget. A selected hard audit independently requires its canonical
+LM-head/sampler witness even when ordinary request sampling is zero.
 
-The Verathos proof protocol binds each served response to registered model
-weights, the validator's prompt, generated token IDs, sampled decode positions,
-and challenged neural-network operations. The validator verifies all opened
-claims against on-chain commitments without running the model. Because
-challenges are unpredictable and repeated across validator traffic, dishonest
-serving is detected with rapidly increasing probability while honest serving
-keeps overhead low enough for production inference.
+The LM-head proof binds the selected hidden row to the authenticated
+`model.lm_head` weights and to the committed runtime logits in those blocks. A
+miner cannot replace the registered LM-head weights inside a valid challenged
+opening.
 
-## See Also
+This is still a sampled vocabulary audit, not a proof of every vocabulary logit
+or every earlier transformer operation.
 
-- [Inference Protocol](inference_protocol.md) - product-level overview of
-  verified inference
-- [Bittensor Integration](bittensor_integration.md) - scoring, epochs, and
-  validator operations
-- [API Reference](api.md) - OpenAI-compatible HTTP API
+## Validator behavior
+
+The validator:
+
+1. resolves the exact live on-chain `ModelSpec`
+2. resolves and authenticates the signed proof-v2 manifest
+3. validates request, output, and precommit-digest bindings
+4. replays nonce and Fiat-Shamir derivation
+5. enforces the exact challenge set
+6. verifies batched sumcheck and IPA openings
+7. verifies decode/LM-head checks when selected
+8. accepts only if every required check passes
+
+Malformed, incomplete, late, or cryptographically invalid v2 payloads fail
+closed.
+
+For a locally verified organic request, proof failure is terminal. The proxy
+does not emit a success receipt or settle API-credit/x402 usage. API-key credit
+is not deducted, and an x402 reservation is released by the normal failure
+cleanup. Text already streamed before verification cannot be recalled; the
+stream ends with an error instead of a successful finish/usage event.
+
+## Proof-version transition
+
+Protocol compatibility and maintenance forgiveness are independent controls.
+The owner publishes an ordered protocol allowlist in subnet runtime config.
+Validators select the newest protocol supported by the validator, allowed by
+the subnet, and advertised by the miner. For example, `[1,3]` accepts a valid
+v1 proof from a legacy miner while selecting v3 for an updated miner. Changing
+the allowlist to `[3]` makes v1 invalid immediately. A future rollout follows
+the same `[3,4]` then `[4]` sequence without adding protocol-specific flags.
+
+Inference proof protocol v2 is reserved and cannot be enabled through this
+allowlist. Missing rollout configuration defaults to `[1,3]`, preventing a
+binary update from enforcing v3 before the owner publishes that transition.
+Invalid proofs remain invalid under every allowlist.
+
+## Operational maintenance grace
+
+Maintenance never changes the requested or accepted wire version. Its
+suppression flags can temporarily make proof, canary, and hot-capacity failures
+non-penalizing while miners update. A failed or missing proof remains recorded
+as unverified; it is not relabeled as a valid proof. Proxy responses may
+complete and settle unverified while the corresponding proxy suppression is
+active.
+
+Maintenance observations provide no proof coverage or pass-rate evidence.
+
+When maintenance expires, enforcement resumes under whichever independent
+proof-version policy is then active.
+
+## Hot-capacity audit
+
+Hot-capacity proof v2 is a separate validator-scheduled audit. It binds:
+
+- validator-owned workload parameters
+- validator-owned `gpu_index` (currently exactly `0`)
+- `B_select`, `B_start`, and `B_proof` block hashes
+- a pre-`B_proof` final commitment
+- workspace state/transition roots
+- sampled GEMM and FP64 work
+
+Miners cannot choose `gpu_index` to alter the proof seed. Capacity proof
+failures are recorded immediately but probation is applied only after all chain
+anchors are finalized. A reorg marks the audit terminally reorged and cannot
+produce probation. The database applies each finalized audit penalty at most
+once.
+
+## What proof v2 establishes
+
+A successful light request establishes that every exact selected registered
+equation verified against the authenticated manifest and the all-operation
+pre-challenge commitment. It does not open the causal trace and therefore does
+not alone establish that the selected equations produced the returned token.
+
+A successful hard request additionally establishes one opened full-layer
+residual corridor for a selected generated decode row, the selected X/Y rows
+and transition replays, and the opened final hidden-row/LM-head/sampler/token
+chain. The miner does not know whether it was selected until after freezing the
+same complete commitment used by light requests.
+
+It does not establish that every layer, attention head, projection column, or
+arbitrary earlier prefill position executed correctly on that request. It also
+does not prove that the committed corridor or post-prefill cache originated
+from the registered-model prefill execution. Verathos therefore describes this
+as a candidate probabilistic audit path, not a full per-request transformer
+SNARK or a completed general economic model-substitution guarantee.

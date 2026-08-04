@@ -32,9 +32,11 @@ DEFAULT_VALIDATORS_PATH = "/tmp/verathos_validators.json"
 
 # How often to re-read the file (seconds)
 FILE_RELOAD_INTERVAL = 60
+HARD_AUDITOR_FILE_MAX_AGE_SECONDS = 900
 
 # Endpoints that don't require validator auth
 PUBLIC_ENDPOINTS = {"/health", "/model_spec", "/docs", "/openapi.json", "/identity/challenge", "/tee/info"}
+PROOF_V3_HARD_CHALLENGE_PATH = "/proof/v3/challenge"
 
 # Rate limiting for public endpoints (per IP).
 # 60/min allows 20 validator proxies health-checking every 10s (= 120/min)
@@ -95,6 +97,7 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
             or os.environ.get("VERATHOS_VALIDATORS_PATH", DEFAULT_VALIDATORS_PATH)
         )
         self._allowed_ss58: Set[str] = set()  # SS58-encoded hotkey addresses
+        self._proof_v3_hard_auditor_ss58 = ""
         self._last_load: float = 0.0
         self._no_file_warned: bool = False  # Avoid spamming the missing-file warning
         self._public_limiter = _PublicRateLimiter()
@@ -108,6 +111,10 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
         self._last_load = now
 
         if not self._validators_path.exists():
+            # Ordinary access may retain the last-good validator set during a
+            # transient refresh failure, but hard-proof authority must not
+            # survive a missing policy file.
+            self._proof_v3_hard_auditor_ss58 = ""
             if not self._no_file_warned:
                 logger.warning(
                     "Validators file not found at %s — non-public requests will be "
@@ -121,6 +128,24 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
             data = json.loads(self._validators_path.read_text())
             validators = data.get("validators", [])
             new_ss58 = {v["hotkey_ss58"] for v in validators if v.get("hotkey_ss58")}
+            hard_policy = data.get("proof_v3_hard_auditor", {})
+            hard_hotkey = ""
+            updated_at = data.get("updated_at")
+            hard_policy_fresh = (
+                isinstance(updated_at, (int, float))
+                and not isinstance(updated_at, bool)
+                and 0.0
+                <= now - float(updated_at)
+                <= HARD_AUDITOR_FILE_MAX_AGE_SECONDS
+            )
+            if (
+                hard_policy_fresh
+                and isinstance(hard_policy, dict)
+                and hard_policy.get("enabled") is True
+            ):
+                candidate = hard_policy.get("validator_hotkey_ss58", "")
+                if isinstance(candidate, str) and candidate in new_ss58:
+                    hard_hotkey = candidate
 
             if new_ss58 != self._allowed_ss58:
                 logger.info(
@@ -128,8 +153,12 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
                     len(new_ss58), self._validators_path,
                 )
             self._allowed_ss58 = new_ss58
+            self._proof_v3_hard_auditor_ss58 = hard_hotkey
             self._no_file_warned = False
         except Exception as e:
+            # Ordinary validator access may retain its last-good set, but hard
+            # proof authority always fails closed on a malformed policy file.
+            self._proof_v3_hard_auditor_ss58 = ""
             logger.warning("Failed to load validators file: %s", e)
 
     async def dispatch(self, request: Request, call_next):
@@ -205,5 +234,20 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
 
         # Store validated hotkey on request state for downstream logging
         request.state.validator_hotkey = hotkey_ss58
+        request.state.proof_v3_hard_auditor_authorized = bool(
+            hotkey_ss58 == self._proof_v3_hard_auditor_ss58
+        )
+        if (
+            request.url.path == PROOF_V3_HARD_CHALLENGE_PATH
+            and not request.state.proof_v3_hard_auditor_authorized
+        ):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": (
+                        "Validator is not authorized for proof-v3 hard openings"
+                    )
+                },
+            )
 
         return await call_next(request)

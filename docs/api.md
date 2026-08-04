@@ -383,22 +383,29 @@ The miner server is what miners run. Validators interact with it directly during
 
 ### Protocol
 
-The verification protocol is **non-interactive** (Fiat-Shamir): a single `POST /inference` streams tokens and returns commitment + proofs. No separate proof request needed.
+Proof v2 uses the inference stream plus one authenticated nonce-reveal request.
+The miner streams all text tokens immediately, freezes its response
+commitment, emits `proof_precommit` with its digest, then receives the
+validator nonce at `POST /proof/v2/challenge`. The full frozen commitment is
+streamed immediately after its digest so that its transfer overlaps the reveal
+and proof work. The proof follows on the still-open inference stream.
 
 ```mermaid
 sequenceDiagram
     participant V as Validator
     participant M as Miner
 
-    V->>M: GET /model_spec
-    M-->>V: ModelSpec (roots, dims, ...)
-    V->>M: POST /inference (SSE stream)
-    M-->>V: tokens (streaming)
-    M-->>V: commitment + proofs (final event)
-    V->>V: Verify proofs locally
+    V->>M: POST /inference or /chat (nonce commitment)
+    M-->>V: text tokens (including final token)
+    M-->>V: proof_precommit
+    V->>M: POST /proof/v2/challenge (nonce reveal)
+    M-->>V: proof_commitment (full frozen commitment)
+    M-->>V: done (proof)
+    V->>V: Verify against chain ModelSpec + signed manifest
 ```
 
-**Total: 2 HTTP requests.** True non-interactive protocol.
+**Total: 2 POST requests.** The second request is a small challenge reveal, not
+a second inference. See [Proof Protocol v2](proof_protocol.md).
 
 ### `GET /health`
 

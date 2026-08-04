@@ -362,6 +362,37 @@ python -m neurons.validator \
     --subtensor-network finney
 ```
 
+Ordinary validators default to follower mode: they run their own light
+canaries and consume the designated owner's signed hard/capacity verdict
+snapshot from the network-scoped feed. Testnet uses
+`https://verathos.ai/gleipnir/testnet/v1/verdicts/current`; mainnet uses
+`https://api.verathos.ai/v1/verdicts/current`. The designated owner must
+explicitly enable local verification:
+
+```bash
+export VERATHOS_PROOF_V3_VERDICT_SOURCE=verify
+python -m neurons.validator ...
+```
+
+An independent validator that re-verifies retained hard bundles also sets
+`VERATHOS_PROOF_V3_VERDICT_SOURCE=verify`. Only the validator whose hotkey
+matches the subnet-configured hard auditor schedules hard audits; other verify
+validators fetch the retained bundle directly from the miner. An owner left
+on the follower default fails startup.
+
+Runtime subnet policy is network-scoped. Testnet miners and validators use
+`https://verathos.ai/gleipnir/testnet/subnet-config.json`; mainnet continues
+to use `https://api.verathos.ai/v1/subnet-config`. An explicit
+`VERATHOS_SUBNET_CONFIG_URL` remains available for private/local networks.
+`VERATHOS_OWNER_VERDICT_URL` similarly overrides verdict-feed discovery for
+private/local deployments.
+
+On validators with more than eight CPU cores, set
+`VERATHOS_PCS_V2_THREADS=16` or `32` before starting the validator to enlarge
+the native proof-verification worker pool. Keep the value at or below the
+cores available to the validator process; the default is capped at eight and
+is appropriate for smaller hosts.
+
 **With a local subtensor:**
 ```bash
 python -m neurons.validator \
@@ -515,9 +546,46 @@ The `chain_config.json` specifies the chain ID and contract addresses. The RPC U
   "payment_gateway_address": "0x...",
   "validator_registry_address": "0x...",
   "checkpoint_registry_address": "0x...",
+  "proof_v2_artifact_base_urls": [
+    "https://proofs.example.com/v2/964-96"
+  ],
+  "proof_v3_artifact_base_urls": [
+    "https://verathos.ai/gleipnir/mainnet/"
+  ],
   "mock": false
 }
 ```
+
+When configured, miners and validators download authenticated proof-v2
+artifacts automatically:
+
+- Validators cache only the signed manifest for each registered model.
+- Miners cache the signed manifest and weight-commitment catalog for the model
+  they serve.
+- Every download is size- and SHA-256-checked. Manifests are then verified
+  against the current on-chain `ModelSpec` and manifest authority.
+- Cached artifacts remain usable if the artifact host is temporarily
+  unavailable.
+
+The first URL is the primary store. Additional URLs are read-only mirrors.
+Operators normally use the URLs shipped in the official chain config. Local or
+air-gapped deployments can override them:
+
+```bash
+--proof-v2-artifact-base-url https://mirror.example.com/v2/964-96
+--proof-v2-artifact-cache-dir /var/cache/verathos/proof-v2
+```
+
+Explicit `--proof-v2-manifest` paths, and the miner's matching
+`--proof-v2-weight-catalog`, take precedence over downloaded artifacts.
+
+Proof-v3 releases use the same authenticated, content-addressed resolution
+model. The bundled mainnet and testnet configs use separate index roots:
+`https://verathos.ai/gleipnir/mainnet/` and
+`https://verathos.ai/gleipnir/testnet/`. Each index is bound to its chain ID,
+netuid and ModelRegistry address, and every signed artifact is checked against
+that network's current `ModelRegistry.owner()`. A testnet artifact therefore
+cannot be admitted on mainnet.
 
 The official config files are included in the repository:
 - `chain_config.json`: mainnet (Subnet 96, chain ID 964)

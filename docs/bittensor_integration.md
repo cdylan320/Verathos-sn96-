@@ -13,7 +13,7 @@ sequenceDiagram
     participant V as Validator
     participant M as Miner
 
-    Note over EVM: ModelRegistry (Merkle roots)<br/>MinerRegistry (endpoints)<br/>PaymentGateway (deposits)
+    Note over EVM: ModelRegistry (ModelSpec roots)<br/>MinerRegistry (endpoints)<br/>PaymentGateway (deposits)
     Note over Sub: Metagraph (UIDs, hotkeys)
     Note over EVM,Sub: Bridged via precompiles
 
@@ -22,10 +22,12 @@ sequenceDiagram
     V->>EVM: Discover miners (MinerRegistry)
 
     loop Every request (organic or canary)
-        V->>M: Inference request + nonce
-        M-->>V: Response + proof
-        V->>V: Verify proof vs on-chain roots
-        V->>M: Push signed receipt
+        V->>M: Inference request + nonce commitment
+        M-->>V: Stream tokens + frozen proof precommit
+        V->>M: Reveal nonce
+        M-->>V: Proof payload
+        V->>V: Verify vs ModelSpec + signed manifest
+        V->>M: Push receipt on accepted work
     end
 
     loop Every epoch (~72 min)
@@ -39,14 +41,14 @@ sequenceDiagram
 
 | Contract | Purpose |
 |----------|---------|
-| **ModelRegistry** | Weight Merkle roots, the trust anchor for proof verification |
+| **ModelRegistry** | Model identity and canonical roots used to authenticate proof manifests |
 | **MinerRegistry** | Miner endpoints, heartbeats, model registrations |
 | **PaymentGateway** | User deposits, treasury splits, staking |
 | **UsageCheckpointRegistry** | On-chain usage snapshots for disaster recovery |
 
 ### Receipts
 
-Every verified inference (organic or canary) produces a **signed receipt** with measured metrics (TTFT, tok/s, tokens, proof pass/fail). The validator signs the receipt with Ed25519 and pushes it to the miner. Miners accumulate receipts from ALL validators throughout the epoch. At epoch close, every validator pulls the full receipt set from each miner, ensuring all validators see the same data for Yuma consensus.
+Every accepted verified inference (organic or canary) can produce a **signed receipt** with measured metrics (TTFT, tok/s, tokens, proof result). A locally rejected organic proof is terminal and does not produce a success receipt or paid-usage settlement. Miners accumulate accepted receipts from validators throughout the epoch. At epoch close, validators pull receipt sets for scoring.
 
 ## Epoch Lifecycle
 
@@ -75,7 +77,9 @@ Canary tests are synthetic requests that the validator schedules throughout each
 - Remaining small canaries still measure throughput and latency for scoring
 - Tests spread evenly across the epoch for natural-looking traffic
 
-Any proof failure (whether from organic traffic or a canary) triggers **instant score zeroing and probation**.
+An invalid inference proof triggers the normal immediate proof-failure and
+probation path. Hot-capacity audit penalties are applied only after the
+validator confirms the audit's chain anchors are finalized.
 
 ## Scoring
 
