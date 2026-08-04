@@ -239,6 +239,48 @@ def proof_v3_cuda_wheel_is_current(wheel: Path) -> bool:
     return True
 
 
+def proof_v3_cuda_runtime_smoke() -> bool:
+    """Load and execute both bundled kernel families in a fresh process."""
+    program = """
+import torch
+from verathos_proof_v3_cuda import load_fused_kernels, load_tree_kernels
+fold = load_fused_kernels()
+tree = load_tree_kernels()
+for name in ('round_partials', 'lerp_fold', 'product_round_partials', 'fs_round_v2'):
+    assert hasattr(fold, name), name
+for name in ('leaf_hash_w1', 'leaf_hash_wn_base', 'node_hash', 'node_hash_base'):
+    assert hasattr(tree, name), name
+folded = fold.lerp_fold(torch.tensor([1, 2], dtype=torch.int64, device='cuda'), 0)
+assert folded.cpu().tolist() == [1]
+leaf = tree.leaf_hash_wn_base(
+    torch.zeros(90, dtype=torch.uint8, device='cuda'),
+    torch.tensor([1], dtype=torch.int64, device='cuda'),
+    0,
+    1,
+)
+assert tuple(leaf.shape) == (32,)
+torch.cuda.synchronize()
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        bt.logging.error("proof-v3 CUDA runtime smoke timed out")
+        return False
+    if result.returncode != 0:
+        bt.logging.error(
+            "proof-v3 CUDA runtime smoke failed: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+        return False
+    return True
+
+
 def ensure_local_proof_v3_cuda_wheel() -> bool:
     """Ensure first-start after an old updater has the release proof runtime."""
     wheel = _selected_proof_v3_cuda_wheel()
@@ -247,12 +289,13 @@ def ensure_local_proof_v3_cuda_wheel() -> bool:
             "No unique bundled proof-v3 CUDA wheel matches Python and torch CUDA"
         )
         return False
-    if proof_v3_cuda_wheel_is_current(wheel):
-        return True
-    if not install_local_proof_v3_cuda_wheel():
-        return False
-    importlib.invalidate_caches()
-    return proof_v3_cuda_wheel_is_current(wheel)
+    if not proof_v3_cuda_wheel_is_current(wheel):
+        if not install_local_proof_v3_cuda_wheel():
+            return False
+        importlib.invalidate_caches()
+        if not proof_v3_cuda_wheel_is_current(wheel):
+            return False
+    return proof_v3_cuda_runtime_smoke()
 
 
 def get_local_head() -> Optional[str]:
