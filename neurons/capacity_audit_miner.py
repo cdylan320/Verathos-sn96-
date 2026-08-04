@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,6 +81,14 @@ class PreparedAuditProcess:
     challenge_file: Path
     start_file: Path
     ready_file: Path
+
+
+@dataclass(frozen=True)
+class _ValidatorDelivery:
+    path: str
+    artifact: dict
+    attempts: int
+    retry_delay_s: float
 
 
 def _coerce_block_hash(raw: object) -> Optional[bytes]:
@@ -176,6 +184,12 @@ class CapacityAuditMinerWorker:
         self._workspace_ext_ready = False
         self._resolved_epoch_blocks: Optional[int] = None
         self._audit_endpoint_rejections: dict[str, set[str]] = {}
+        self._audit_endpoint_rejections_lock = threading.Lock()
+        self._publisher_lock = threading.Lock()
+        self._publisher_result_lock = threading.Lock()
+        self._publisher_stop = threading.Event()
+        self._publisher_queues: dict[str, queue.Queue[_ValidatorDelivery]] = {}
+        self._publisher_threads: dict[str, threading.Thread] = {}
 
     def _refresh_subnet_runtime_config(
         self,
@@ -345,6 +359,7 @@ class CapacityAuditMinerWorker:
 
     def stop(self) -> None:
         self._running = False
+        self._publisher_stop.set()
 
     def _subtensor(self):
         SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
@@ -1755,16 +1770,16 @@ class CapacityAuditMinerWorker:
                     f"audit_id={audit_slot.audit_id[:12]}"
                 )
             else:
-                accepted = self._publish_proof(proof_payload) or 0
-                if accepted > 0:
+                queued = self._publish_proof(proof_payload) or 0
+                if queued > 0:
                     bt.logging.info(
-                        f"Capacity audit artifacts published: "
-                        f"audit_id={audit_slot.audit_id[:12]} validators={accepted}"
+                        f"Capacity audit proof queued: "
+                        f"audit_id={audit_slot.audit_id[:12]} validators={queued}"
                     )
                 else:
                     bt.logging.debug(
-                        "Capacity audit publish complete: "
-                        f"audit_id={audit_slot.audit_id[:12]} accepted=0"
+                        "Capacity audit proof queue complete: "
+                        f"audit_id={audit_slot.audit_id[:12]} validators=0"
                     )
         self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
         self._clear_audit_drain(audit_slot.audit_id)
@@ -1882,107 +1897,173 @@ class CapacityAuditMinerWorker:
     ) -> int:
         audit_id = str(artifact.get("audit_id") or "")
         artifact_type = str(artifact.get("artifact_type") or "")
-        accepted = 0
-        for attempt in range(max(1, int(attempts))):
-            pending: list[str] = []
-            all_validator_urls = self._validator_endpoint_urls(force_refresh=attempt > 0)
-            validator_urls = all_validator_urls
-            if audit_id:
-                validator_urls = tuple(
-                    base for base in validator_urls if not self._validator_rejected_audit(base, audit_id)
+        validator_urls = self._validator_endpoint_urls(force_refresh=False)
+        if not validator_urls:
+            bt.logging.warning(
+                f"Capacity audit publish has no validator endpoints: "
+                f"audit_id={audit_id[:12]} type={artifact_type}"
+            )
+            return 0
+        delivery = _ValidatorDelivery(
+            path=path,
+            artifact=artifact,
+            attempts=max(1, int(attempts)),
+            retry_delay_s=max(0.0, float(retry_delay_s)),
+        )
+        queued = 0
+        for endpoint in validator_urls:
+            if audit_id and self._validator_rejected_audit(endpoint, audit_id):
+                continue
+            endpoint_queue = self._publisher_queue(endpoint)
+            try:
+                endpoint_queue.put_nowait(delivery)
+                queued += 1
+            except queue.Full:
+                bt.logging.warning(
+                    "Capacity audit endpoint queue full; dropping only this destination: "
+                    f"audit_id={audit_id[:12]} type={artifact_type} endpoint={endpoint}"
                 )
-            if not validator_urls:
-                message = (
-                    f"Capacity audit publish has no validator endpoints: "
-                    f"audit_id={audit_id[:12]} "
-                    f"type={artifact_type}"
+                self._record_validator_publish_result(
+                    endpoint,
+                    False,
+                    failure_kind="transient",
                 )
-                if audit_id and all_validator_urls:
+        return queued
+
+    def _publisher_queue(self, endpoint: str) -> queue.Queue[_ValidatorDelivery]:
+        endpoint = str(endpoint or "").rstrip("/")
+        with self._publisher_lock:
+            existing = self._publisher_queues.get(endpoint)
+            if existing is not None:
+                return existing
+            endpoint_queue: queue.Queue[_ValidatorDelivery] = queue.Queue(maxsize=8)
+            thread = threading.Thread(
+                target=self._publisher_worker,
+                args=(endpoint, endpoint_queue),
+                name=f"capacity-publisher-{len(self._publisher_threads) + 1}",
+                daemon=True,
+            )
+            self._publisher_queues[endpoint] = endpoint_queue
+            self._publisher_threads[endpoint] = thread
+            thread.start()
+            return endpoint_queue
+
+    def _publisher_worker(
+        self,
+        endpoint: str,
+        endpoint_queue: queue.Queue[_ValidatorDelivery],
+    ) -> None:
+        while not self._publisher_stop.is_set() or not endpoint_queue.empty():
+            try:
+                delivery = endpoint_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._deliver_to_validator(endpoint, delivery)
+            except Exception as exc:
+                bt.logging.warning(
+                    f"Capacity audit publisher worker error: endpoint={endpoint}: {exc}"
+                )
+                self._record_validator_publish_result(
+                    endpoint,
+                    False,
+                    failure_kind="transient",
+                )
+            finally:
+                endpoint_queue.task_done()
+
+    def _deliver_to_validator(
+        self,
+        endpoint: str,
+        delivery: _ValidatorDelivery,
+    ) -> None:
+        path = delivery.path
+        artifact = delivery.artifact
+        audit_id = str(artifact.get("audit_id") or "")
+        artifact_type = str(artifact.get("artifact_type") or "")
+        if audit_id and self._validator_rejected_audit(endpoint, audit_id):
+            return
+        for attempt in range(delivery.attempts):
+            try:
+                resp = httpx.post(
+                    f"{endpoint}{path}",
+                    json=artifact,
+                    timeout=5.0,
+                )
+            except Exception as exc:
+                bt.logging.warning(
+                    f"Capacity audit publish error: audit_id={audit_id[:12]} "
+                    f"type={artifact_type} url={endpoint}{path}: {exc}"
+                )
+                self._record_validator_publish_result(
+                    endpoint,
+                    False,
+                    failure_kind="transient",
+                )
+                retryable = True
+            else:
+                if resp.status_code < 300:
+                    self._record_validator_publish_result(endpoint, True)
+                    break
+                if self._is_unknown_audit_slot_response(resp.status_code, resp.text):
                     bt.logging.debug(
-                        "Capacity audit publish complete: "
+                        "Capacity audit endpoint response: "
                         f"audit_id={audit_id[:12]} type={artifact_type} "
-                        "endpoints=0"
+                        f"status=slot_unknown url={endpoint}{path}"
                     )
-                else:
-                    bt.logging.warning(message)
-                return accepted
+                    self._record_validator_audit_rejection(endpoint, audit_id)
+                    return
+                bt.logging.warning(
+                    f"Capacity audit publish failed: audit_id={audit_id[:12]} "
+                    f"type={artifact_type} B_select={artifact.get('B_select')} "
+                    f"B_start={artifact.get('B_start')} B_proof={artifact.get('B_proof')} "
+                    f"url={endpoint}{path} status={resp.status_code} body={resp.text[:200]}"
+                )
+                failure_kind = self._validator_endpoint_failure_kind(resp.status_code)
+                if failure_kind:
+                    self._record_validator_publish_result(
+                        endpoint,
+                        False,
+                        failure_kind=failure_kind,
+                    )
+                retryable = resp.status_code in (409, 425, 429, 500, 502, 503, 504)
+                if not retryable:
+                    return
+            if attempt + 1 >= delivery.attempts:
+                return
+            if self._publisher_stop.wait(max(0.1, delivery.retry_delay_s)):
+                return
 
-            def _post(base: str):
-                try:
-                    resp = httpx.post(
-                        f"{base}{path}",
-                        json=artifact,
-                        timeout=5.0,
-                    )
-                    return base, resp, None
-                except Exception as exc:
-                    return base, None, exc
+    def _wait_for_async_publishes_for_test(self, timeout_s: float = 2.0) -> bool:
+        """Wait for current publisher queues without affecting production flow."""
 
-            with ThreadPoolExecutor(max_workers=max(1, len(validator_urls))) as executor:
-                future_map = {executor.submit(_post, base): base for base in validator_urls}
-                for future in as_completed(future_map):
-                    base = future_map[future]
-                    try:
-                        base, resp, exc = future.result()
-                    except Exception as exc:  # defensive; _post should capture transport errors
-                        resp = None
-                    if exc is not None or resp is None:
-                        bt.logging.warning(
-                            f"Capacity audit publish error: audit_id={audit_id[:12]} "
-                            f"type={artifact_type} url={base}{path}: {exc}"
-                        )
-                        self._record_validator_publish_result(base, False, failure_kind="transient")
-                        pending.append(base)
-                        continue
-                    if resp.status_code < 300:
-                        self._record_validator_publish_result(base, True)
-                        accepted += 1
-                        continue
-                    retryable = resp.status_code in (409, 425, 429, 500, 502, 503, 504)
-                    if self._is_unknown_audit_slot_response(resp.status_code, resp.text):
-                        bt.logging.debug(
-                            "Capacity audit endpoint response: "
-                            f"audit_id={audit_id[:12]} type={artifact_type} "
-                            f"status=slot_unknown url={base}{path}"
-                        )
-                        self._record_validator_audit_rejection(base, audit_id)
-                        continue
-                    bt.logging.warning(
-                        f"Capacity audit publish failed: audit_id={audit_id[:12]} "
-                        f"type={artifact_type} B_select={artifact.get('B_select')} "
-                        f"B_start={artifact.get('B_start')} B_proof={artifact.get('B_proof')} "
-                        f"url={base}{path} status={resp.status_code} body={resp.text[:200]}"
-                    )
-                    failure_kind = self._validator_endpoint_failure_kind(resp.status_code)
-                    if failure_kind:
-                        self._record_validator_publish_result(
-                            base,
-                            False,
-                            failure_kind=failure_kind,
-                        )
-                    if retryable:
-                        pending.append(base)
-            if not pending or attempt + 1 >= max(1, int(attempts)):
-                return accepted
-            time.sleep(max(0.1, float(retry_delay_s)))
-        return accepted
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while time.monotonic() < deadline:
+            with self._publisher_lock:
+                queues = tuple(self._publisher_queues.values())
+            if all(endpoint_queue.unfinished_tasks == 0 for endpoint_queue in queues):
+                return True
+            time.sleep(0.005)
+        return False
 
     def _validator_rejected_audit(self, endpoint: str, audit_id: str) -> bool:
-        rejected = getattr(self, "_audit_endpoint_rejections", None)
-        if not isinstance(rejected, dict):
-            return False
-        return str(endpoint or "") in rejected.get(str(audit_id or ""), set())
+        with self._audit_endpoint_rejections_lock:
+            rejected = getattr(self, "_audit_endpoint_rejections", None)
+            if not isinstance(rejected, dict):
+                return False
+            return str(endpoint or "") in rejected.get(str(audit_id or ""), set())
 
     def _record_validator_audit_rejection(self, endpoint: str, audit_id: str) -> None:
         audit_id = str(audit_id or "")
         endpoint = str(endpoint or "")
         if not audit_id or not endpoint:
             return
-        rejected = getattr(self, "_audit_endpoint_rejections", None)
-        if not isinstance(rejected, dict):
-            rejected = {}
-            self._audit_endpoint_rejections = rejected
-        rejected.setdefault(audit_id, set()).add(endpoint)
+        with self._audit_endpoint_rejections_lock:
+            rejected = getattr(self, "_audit_endpoint_rejections", None)
+            if not isinstance(rejected, dict):
+                rejected = {}
+                self._audit_endpoint_rejections = rejected
+            rejected.setdefault(audit_id, set()).add(endpoint)
         bt.logging.debug(
             "Capacity audit endpoint response recorded: "
             f"audit_id={audit_id[:12]} endpoint={endpoint}"
@@ -2003,10 +2084,11 @@ class CapacityAuditMinerWorker:
     ) -> None:
         resolver = getattr(self, "_validator_endpoint_resolver", None)
         if resolver is not None:
-            try:
-                resolver.record_publish_result(endpoint, success, failure_kind=failure_kind)
-            except TypeError:
-                resolver.record_publish_result(endpoint, success)
+            with self._publisher_result_lock:
+                try:
+                    resolver.record_publish_result(endpoint, success, failure_kind=failure_kind)
+                except TypeError:
+                    resolver.record_publish_result(endpoint, success)
 
     @staticmethod
     def _validator_endpoint_failure_kind(status_code: int) -> str:
