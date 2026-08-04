@@ -1,19 +1,29 @@
 # What is Verathos?
 
-**Verathos is an AI compute network on [Bittensor](https://bittensor.com) (Subnet 96).** Its proof-v2 candidate uses probabilistic sumcheck and polynomial-commitment audits for unpredictable selected registered model operations. Validators verify those selected claims on CPU without loading model weights. The proof-v2 execution profile remains subject to checkpoint E2E, adversarial substitute-execution, and performance release gates.
+**Verathos is an AI compute network on [Bittensor](https://bittensor.com)
+(Subnet 96).** Gleipnir proof protocol v3 combines nonce-free light response
+commitments with unpredictable hard execution audits. Validators check signed
+model profiles and selected execution relations on CPU without loading model
+weights.
 
 ## What We Verify
 
-### Verified Inference: Proof-v2 Candidate
+### Probabilistic verified inference: Gleipnir v3
 
-A proof plugin integrates directly into vLLM serving. It captures the registered runtime inputs and outputs needed for proof v2 without delaying text-token streaming. After the miner freezes its all-layer commitment, the validator reveals a committed nonce and both sides derive the exact sampled layer and block set. Native batched sumcheck and IPA proofs are then generated for the selected claims.
+A graph-integrated capture plugin prepares authenticated execution roots without
+delaying token streaming. Every ordinary response is bound to a light
+commitment. On an unpredictable canary, the validator reveals its nonce only
+after that commitment is frozen and the miner proves the derived execution
+relations.
 
 ```mermaid
 flowchart LR
     A["Prompt"] --> B["Inference"]
     B --> C["Freeze all-layer\ncommitment"]
-    C --> D["Reveal nonce +\nselect k layers"]
-    D --> E["Verify vs chain spec\n+ signed manifest"]
+    C --> D{"Hidden hard\ndecision"}
+    D -->|light| E["Validate request/output\ncommitment"]
+    D -->|hard| G["Reveal nonce +\nprove selected trace"]
+    G --> E["Verify vs chain spec\n+ signed profile"]
     E --> F["Audited\nresponse"]
 
     style A fill:#3b82f6,color:#fff
@@ -36,19 +46,16 @@ The same proof system extends to training. The training prover verifies the forw
 
 | Claim | How it's verified |
 |-------|-------------------|
-| **Authenticated selected weights** | IPA openings bind selected operations to an authority-signed manifest that must match the live on-chain ModelSpec. |
-| **Sound selected computation** | Batched sumcheck plus authenticated terminal openings verifies selected `X × W = Y` claims. |
-| **Response binding** | The prompt and output-token history are transcript-bound. A nonce-selected hard audit opens one full residual corridor for a selected decode row and binds it through final hidden state, LM head, sampler, and returned token. |
-| **Probabilistic coverage** | Light audits sample signed-weight equations. Hard audits sample operation and transition replay in selected layers under a signed policy. |
+| **Light response binding** | The prompt, sampler, observed output and frozen runtime roots are bound to one canonical v3 envelope. |
+| **Authenticated selected weights** | Hard openings bind selected operations to authority-signed artifacts matching the live on-chain ModelSpec. |
+| **Sound selected computation** | The compact-v9 hard proof verifies the nonce-selected registered relations and connected terminal path. |
+| **Probabilistic coverage** | Secret-seeded hard canaries sample execution under a signed policy; hot-capacity auditing supplies a complementary resource check. |
 
-The current proof is not a full transformer SNARK. Light proofs do not open the
-causal trace. Hard proofs independently replay selected full-attention/GDN
-decode transitions and open a full-row residual corridor, but not every
-attention head, projection column, or earlier prefill position. They do not yet
-prove that the committed corridor or post-prefill cache was produced by the
-registered model, so this candidate does not yet make a general economic
-model-substitution guarantee. The raw K/V full-attention path is bounded and is
-not a qualified 250k- or 1m-context proof path.
+Gleipnir is not a full transformer SNARK. A light response is a commitment
+success, not a hard execution proof. Hard proofs open selected registered
+relations rather than every operation. The production claim is probabilistic
+economic integrity across repeated hidden audits, not deterministic proof of
+every operation on every request.
 
 ### TEE Verification (complementary, not yet enabled on mainnet)
 
@@ -68,8 +75,9 @@ On-chain smart contracts on Bittensor EVM handle model registration, miner endpo
 
 ## OpenAI-Compatible API
 
-Drop-in replacement for any OpenAI SDK. Point your `base_url` at Verathos and
-proof-bound responses carry validator verification status.
+Drop-in replacement for any OpenAI SDK. Point your `base_url` at Verathos;
+ordinary responses use the normal OpenAI shape and expose protocol metadata
+when requested.
 
 ```python
 from openai import OpenAI
@@ -86,11 +94,10 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-Verified responses include `proof_verified: true` and verification timing. A
-bounded v1 compatibility response is recorded as legacy compatibility, not v2
-success; maintenance-suppressed proof failures remain unverified. Set `model`
-to `"auto"` and the gateway picks the best available node across all models via
-score-weighted routing.
+Ordinary v3 responses report an accepted light proof rather than fabricating
+a hard-audit verdict. A legacy v1 compatibility response remains v1, and a
+maintenance-suppressed failure remains a recorded failure. Set `model` to
+`"auto"` and the gateway picks an eligible node using score-weighted routing.
 
 ## Integrations
 
@@ -136,6 +143,6 @@ be explicitly unverified; maintenance does not turn it into a valid proof.
 - **[Setup Guide](setup.md)**: Run a miner or validator
 - **[API Reference](api.md)**: Full HTTP API reference
 - **[Bittensor Integration](bittensor_integration.md)**: Epoch testing, scoring, architecture
-- **[Inference Protocol](inference_protocol.md)**: Deep dive into sumcheck-based verification
+- **[Inference Protocol](inference_protocol.md)**: Light proofs and unpredictable hard audits
 - **[Active Research](research.md)**: Intelligent routing, verified training, and long-term vision
 - **[Economic Model](economic_model.md)**: Tokenomics, alpha staking, pricing details

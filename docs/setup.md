@@ -405,7 +405,7 @@ python -m neurons.validator \
 **What the validator does each epoch (~72 min):**
 1. Discovers active miners from MinerRegistry
 2. Schedules canary tests (indistinguishable from real traffic)
-3. Verifies cryptographic proofs for each test
+3. Verifies each test at the proof tier selected by the signed policy
 4. Scores miners on throughput, latency, and model utility (parameters, context length, quantization)
 5. Sets weights on Bittensor
 
@@ -427,7 +427,7 @@ The validator checks the git remote every 30 minutes. If a new validator version
 |----------|-------------|
 | GPU | None |
 | RAM | 16 GB+ (tokenizers loaded for proof verification) |
-| CPU | 4+ cores, 2.0 GHz+ (proof verification takes ~4ms) |
+| CPU | Modern multi-core CPU; hard-proof verification is profile-dependent |
 | Storage | 50 GB+ SSD |
 | Network | 100 Mbps up/down (HTTP to miners + WebSocket to Substrate) |
 
@@ -546,9 +546,6 @@ The `chain_config.json` specifies the chain ID and contract addresses. The RPC U
   "payment_gateway_address": "0x...",
   "validator_registry_address": "0x...",
   "checkpoint_registry_address": "0x...",
-  "proof_v2_artifact_base_urls": [
-    "https://proofs.example.com/v2/964-96"
-  ],
   "proof_v3_artifact_base_urls": [
     "https://verathos.ai/gleipnir/mainnet/"
   ],
@@ -556,8 +553,8 @@ The `chain_config.json` specifies the chain ID and contract addresses. The RPC U
 }
 ```
 
-When configured, miners and validators download authenticated proof-v2
-artifacts automatically:
+When configured, miners and validators download authenticated proof artifacts
+automatically:
 
 - Validators cache only the signed manifest for each registered model.
 - Miners cache the signed manifest and weight-commitment catalog for the model
@@ -568,16 +565,7 @@ artifacts automatically:
   unavailable.
 
 The first URL is the primary store. Additional URLs are read-only mirrors.
-Operators normally use the URLs shipped in the official chain config. Local or
-air-gapped deployments can override them:
-
-```bash
---proof-v2-artifact-base-url https://mirror.example.com/v2/964-96
---proof-v2-artifact-cache-dir /var/cache/verathos/proof-v2
-```
-
-Explicit `--proof-v2-manifest` paths, and the miner's matching
-`--proof-v2-weight-catalog`, take precedence over downloaded artifacts.
+Operators normally use the URLs shipped in the official chain config.
 
 Proof-v3 releases use the same authenticated, content-addressed resolution
 model. The bundled mainnet and testnet configs use separate index roots:

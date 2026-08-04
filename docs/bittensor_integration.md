@@ -22,11 +22,13 @@ sequenceDiagram
     V->>EVM: Discover miners (MinerRegistry)
 
     loop Every request (organic or canary)
-        V->>M: Inference request + nonce commitment
+        V->>M: Signed v3 inference request
         M-->>V: Stream tokens + frozen proof precommit
-        V->>M: Reveal nonce
-        M-->>V: Proof payload
-        V->>V: Verify vs ModelSpec + signed manifest
+        opt Post-commitment hard canary
+            V->>M: Reveal nonce
+            M-->>V: Hard proof payload
+        end
+        V->>V: Check light proof or hard proof
         V->>M: Push receipt on accepted work
     end
 
@@ -48,7 +50,11 @@ sequenceDiagram
 
 ### Receipts
 
-Every accepted verified inference (organic or canary) can produce a **signed receipt** with measured metrics (TTFT, tok/s, tokens, proof result). A locally rejected organic proof is terminal and does not produce a success receipt or paid-usage settlement. Miners accumulate accepted receipts from validators throughout the epoch. At epoch close, validators pull receipt sets for scoring.
+Every accepted inference can produce a **signed receipt** with measured metrics
+(TTFT, tok/s, tokens and the actual proof tier/verdict). A rejected protocol
+exchange does not produce a success receipt or paid-usage settlement. Miners
+accumulate accepted receipts from validators throughout the epoch. At epoch
+close, validators pull receipt sets for scoring.
 
 ## Epoch Lifecycle
 
@@ -61,7 +67,8 @@ One epoch = **360 blocks × 12s = ~72 minutes**.
 
 ## Canary Tests
 
-Canary tests are synthetic requests that the validator schedules throughout each epoch. They are **indistinguishable from real user traffic**, and miners cannot detect whether a request is a test.
+Canary tests use the same authenticated serving path and request shapes as user
+traffic. Hard selection stays hidden until the response commitment is frozen.
 
 **Why canaries exist on top of per-request verification:**
 
@@ -71,11 +78,13 @@ Canary tests are synthetic requests that the validator schedules throughout each
 
 ### Schedule
 
-- **12 small canaries** per miner per epoch (500-2000 input tokens, 100-300 output tokens)
-- **1 full-context canary** per miner per epoch (~80% of max_context_len, 200 output tokens)
-- Proof verification on all full-context canaries and **~30% of small canaries**
-- Remaining small canaries still measure throughput and latency for scoring
-- Tests spread evenly across the epoch for natural-looking traffic
+- The designated auditor schedules **2 light + 1 hard** canary per endpoint per
+  epoch under the signed policy.
+- Other validators schedule light canaries and either authenticate the owner's
+  exact-epoch verdict or explicitly replay retained hard bundles.
+- Context and decode lengths come from the signed, secret-seeded canary policy.
+- Tests are spread across the epoch; hard eligibility is not exposed in the
+  initial request.
 
 An invalid inference proof triggers the normal immediate proof-failure and
 probation path. Hot-capacity audit penalties are applied only after the
@@ -149,13 +158,16 @@ At each weight-setting boundary the validator scales all miner weights by `(1 - 
 
 ### Proof failure
 
-Any proof failure = **instant score zero**. The miner enters probation (every subsequent request gets full proof verification, no probabilistic skipping) and is excluded from organic traffic routing. This is a hard cutoff, not a gradual penalty.
+An invalid required hard proof enters the immediate failure/probation path and
+removes the endpoint from normal organic routing. Maintenance grace can
+temporarily suppress configured consequences during a coordinated update, but
+the real verdict remains recorded.
 
 **Rehabilitation:** Pass 3 consecutive epochs with 100% proof success → probation lifted, organic traffic resumes.
 
-### Detection timeline
-
-With k=2 layers challenged per request on a 32-layer model, a cheater is caught within ~36 requests with 90% probability, and 99% after 72 requests. See [Inference Protocol: Detection Probability](inference_protocol.md#detection-probability) for the full analysis.
+Detection probability depends on the signed profile, selected relation set and
+the deviation being tested. The protocol does not advertise a single generic
+per-request percentage for every form of substituted execution.
 
 ## Resource Requirements
 
@@ -165,7 +177,7 @@ With k=2 layers challenged per request on a 32-layer model, a cheater is caught 
 |----------|-------------|
 | GPU | **None** |
 | RAM | 16 GB+ |
-| CPU | 4+ cores, 2.0 GHz+ (verification ~4ms) |
+| CPU | Modern multi-core CPU; hard-proof verification is profile-dependent |
 | Storage | 50 GB+ SSD |
 | Network | 100 Mbps up/down (HTTP to miners + WebSocket to Substrate) |
 | Cost | ~$20/month VPS |
@@ -208,7 +220,8 @@ Validators will be able to run a gateway, the user-facing API endpoint:
 - **OpenAI-compatible** `/v1/chat/completions`
 - **Dual auth**: API key (prepaid credits) or x402 (USDC pay-per-request)
 - **Score-weighted routing**: selects miners by score from validator shared state
-- **Proof verification**: verifies every response before forwarding to user
+- **Verification metadata**: returns the light-proof or hard-audit result
+  applicable to the request; hard execution audits are selected unpredictably
 
 See the [User Guide](user_guide.md) for the end-user perspective and the [API Reference](api.md) for endpoint documentation.
 
