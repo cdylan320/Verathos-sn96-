@@ -963,6 +963,13 @@ class ValidatorNeuron:
         self._load_probation_recovery_source_epochs()
         # Epoch close state
         self._pending_epoch_close: Optional[int] = None
+        # Finalized-block callbacks can overlap while receipt pulling and
+        # scoring hold the first callback for tens of seconds.  The completed
+        # epoch guard alone is not sufficient because two callbacks can both
+        # observe the old value before either close finishes.  Keep the whole
+        # close transaction single-flight so scoring, EMA updates, the audit
+        # log and the weight submission are each produced exactly once.
+        self._epoch_close_lock = threading.Lock()
         self._auto_updater = None  # Set by main() if --auto-update
         self._epoch_close_block: int = 0
         self._epoch_close_retry_after: float = 0.0  # monotonic time
@@ -8358,48 +8365,62 @@ class ValidatorNeuron:
         On failure (e.g. 429 rate limit), schedules retry with increasing delay
         to avoid hammering the RPC.
         """
-        # Guard: never close the same epoch twice — each re-close blends
-        # another score into the EMA, destroying it.
-        if not hasattr(self, '_last_closed_epoch'):
-            self._last_closed_epoch = -1
-        if epoch_number <= self._last_closed_epoch:
-            self._pending_epoch_close = None
-            return True
-
-        # The validator must schedule every obligation early enough to finish.
-        # Any queued/in-flight work still present here is therefore local
-        # indeterminacy, never evidence against the miner and never a reason to
-        # delay the next canary epoch.
-        self._seal_canary_epoch_for_close(epoch_number)
-
-        now = time.monotonic()
-        if now < self._epoch_close_retry_after:
-            return False  # Still in cooldown from a previous failure
+        close_lock = getattr(self, "_epoch_close_lock", None)
+        if close_lock is None:
+            # Compatibility for narrowly constructed test fixtures.  Normal
+            # validator instances create the lock in __init__ before block
+            # subscription starts.
+            close_lock = threading.Lock()
+            self._epoch_close_lock = close_lock
+        if not close_lock.acquire(blocking=False):
+            return False
 
         try:
-            self._closing_inflight_canaries[epoch_number] = dict(
-                self._inflight_canaries.get(epoch_number, {})
-            )
+            # Guard: never close the same epoch twice — each re-close blends
+            # another score into the EMA, destroying it.  This check must be
+            # inside the single-flight section.
+            if not hasattr(self, '_last_closed_epoch'):
+                self._last_closed_epoch = -1
+            if epoch_number <= self._last_closed_epoch:
+                self._pending_epoch_close = None
+                return True
+
+            # The validator must schedule every obligation early enough to finish.
+            # Any queued/in-flight work still present here is therefore local
+            # indeterminacy, never evidence against the miner and never a reason to
+            # delay the next canary epoch.
+            self._seal_canary_epoch_for_close(epoch_number)
+
+            now = time.monotonic()
+            if now < self._epoch_close_retry_after:
+                return False  # Still in cooldown from a previous failure
+
             try:
-                self._close_epoch(epoch_number)
-            finally:
-                self._closing_inflight_canaries.pop(epoch_number, None)
-            self._pending_epoch_close = None
-            self._last_closed_epoch = epoch_number
-            self._epoch_close_backoff = 30.0  # Reset on success
-            if getattr(self, "_weight_update_due", False):
-                self._schedule_weight_update()
-                self._weight_update_due = False
-            # If auto-update was deferred, apply it now (between epochs)
-            auto_updater = getattr(self, "_auto_updater", None)
-            if auto_updater is not None:
-                auto_updater.notify_not_busy()
-            return True
-        except Exception as e:
-            self._epoch_close_retry_after = now + self._epoch_close_backoff
-            bt.logging.warning(f"Epoch {epoch_number} close failed, retrying in {self._epoch_close_backoff:.0f}s: {e}")
-            self._epoch_close_backoff = min(self._epoch_close_backoff * 2, 300)
-            return False
+                self._closing_inflight_canaries[epoch_number] = dict(
+                    self._inflight_canaries.get(epoch_number, {})
+                )
+                try:
+                    self._close_epoch(epoch_number)
+                finally:
+                    self._closing_inflight_canaries.pop(epoch_number, None)
+                self._pending_epoch_close = None
+                self._last_closed_epoch = epoch_number
+                self._epoch_close_backoff = 30.0  # Reset on success
+                if getattr(self, "_weight_update_due", False):
+                    self._schedule_weight_update()
+                    self._weight_update_due = False
+                # If auto-update was deferred, apply it now (between epochs)
+                auto_updater = getattr(self, "_auto_updater", None)
+                if auto_updater is not None:
+                    auto_updater.notify_not_busy()
+                return True
+            except Exception as e:
+                self._epoch_close_retry_after = now + self._epoch_close_backoff
+                bt.logging.warning(f"Epoch {epoch_number} close failed, retrying in {self._epoch_close_backoff:.0f}s: {e}")
+                self._epoch_close_backoff = min(self._epoch_close_backoff * 2, 300)
+                return False
+        finally:
+            close_lock.release()
 
     # Epoch duration in seconds — 360 blocks × 12s = 4320s ≈ 72 min.
     # Used by the restart-forgiveness window (2 epochs).
