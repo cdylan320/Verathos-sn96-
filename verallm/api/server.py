@@ -649,11 +649,9 @@ def _current_allowed_proof_protocol_versions() -> tuple[int, ...]:
         return state.allowed_proof_protocol_versions
     _proof_protocol_policy_last_load = now
     try:
-        from verallm.api.validator_auth import DEFAULT_VALIDATORS_PATH
+        from verallm.api.validator_auth import resolve_validators_path
 
-        path = Path(
-            os.environ.get("VERATHOS_VALIDATORS_PATH", DEFAULT_VALIDATORS_PATH)
-        )
+        path = resolve_validators_path()
         payload = json.loads(path.read_text())
         raw = payload.get("allowed_proof_protocol_versions")
         if not isinstance(raw, list) or not raw:

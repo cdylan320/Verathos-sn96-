@@ -27,8 +27,31 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
-# Default path for the validator allowlist file
+# Historical fallback when a miner has no configured data directory.
 DEFAULT_VALIDATORS_PATH = "/tmp/verathos_validators.json"
+
+
+def resolve_validators_path(validators_path: Optional[str] = None) -> Path:
+    """Resolve the per-miner validator policy file.
+
+    Multiple miners may share one host.  Their wrapper and serving subprocess
+    must not exchange validator policy through the historical process-global
+    ``/tmp`` path.  ``VERALLM_DATA_DIR`` is already unique per installed miner
+    and owns its other persistent protocol state, so use it unless an explicit
+    policy path was configured.
+    """
+
+    explicit = str(validators_path or "").strip()
+    if not explicit:
+        explicit = os.environ.get("VERATHOS_VALIDATORS_PATH", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+
+    data_dir = os.environ.get("VERALLM_DATA_DIR", "").strip()
+    if data_dir:
+        return Path(data_dir).expanduser() / "validators.json"
+    return Path(DEFAULT_VALIDATORS_PATH)
+
 
 # How often to re-read the file (seconds)
 FILE_RELOAD_INTERVAL = 60
@@ -92,10 +115,7 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
 
     def __init__(self, app, validators_path: Optional[str] = None):
         super().__init__(app)
-        self._validators_path = Path(
-            validators_path
-            or os.environ.get("VERATHOS_VALIDATORS_PATH", DEFAULT_VALIDATORS_PATH)
-        )
+        self._validators_path = resolve_validators_path(validators_path)
         self._allowed_ss58: Set[str] = set()  # SS58-encoded hotkey addresses
         self._proof_v3_hard_auditor_ss58 = ""
         self._last_load: float = 0.0

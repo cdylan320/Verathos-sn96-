@@ -1189,7 +1189,7 @@ class MinerNeuron:
         Validators must have a permit AND meet the on-chain minValidatorStake
         threshold (read from ValidatorRegistry every refresh cycle).
         """
-        from verallm.api.validator_auth import DEFAULT_VALIDATORS_PATH
+        from verallm.api.validator_auth import resolve_validators_path
         try:
             sub = self._get_subtensor()
             metagraph = sub.metagraph(netuid=self.config.netuid)
@@ -1272,7 +1272,9 @@ class MinerNeuron:
                     validators.append({"uid": -1, "hotkey_ss58": ss58, "stake": 0})
                     bt.logging.info(f"Manually allowed validator: {ss58}")
 
-            out_path = os.environ.get("VERATHOS_VALIDATORS_PATH", DEFAULT_VALIDATORS_PATH)
+            out_path_obj = resolve_validators_path()
+            out_path_obj.parent.mkdir(parents=True, exist_ok=True)
+            out_path = str(out_path_obj)
             data = {
                 "updated_at": int(time.time()),
                 "netuid": self.config.netuid,
