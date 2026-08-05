@@ -1720,6 +1720,22 @@ def parse_args():
     return args, _normalize_server_args(server_args)
 
 
+def _neuron_config_from_args(args) -> NeuronConfig:
+    """Construct network-scoped miner config from parsed CLI arguments."""
+
+    overrides = {
+        "wallet_name": args.wallet or "default",
+        "hotkey_name": args.hotkey,
+        "netuid": args.netuid,
+    }
+    if args.subtensor_network:
+        # Bind network-scoped runtime URLs at construction time. Mutating
+        # ``subtensor_network`` afterward leaves the default subnet-config and
+        # owner-verdict URLs on their previous network.
+        overrides["subtensor_network"] = args.subtensor_network
+    return NeuronConfig.from_env(**overrides)
+
+
 def _extract_code_measurement(platform: str, attestation_report: bytes, Web3) -> bytes:
     """Extract and hash the code measurement from an attestation report.
 
@@ -1893,11 +1909,7 @@ def main():
         sys.exit(1)
     args.chain_config = resolved_chain_path  # update for downstream use
 
-    config = NeuronConfig.from_env(
-        wallet_name=args.wallet or "default",
-        hotkey_name=args.hotkey,
-        netuid=args.netuid,
-    )
+    config = _neuron_config_from_args(args)
     if getattr(args, "capacity_audit", False):
         config.capacity_audit_enabled = True
 
