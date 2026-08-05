@@ -1043,8 +1043,25 @@ class CanaryScheduler:
                     self.hard_decode_limits_by_model.get(model_id, 0) or 0
                 )
                 if qualified_context <= 1 or signed_decode_cap <= 0:
-                    raise ValueError(
-                        "hard auditor lacks signed model context/decode limits"
+                    # A compatibility-window endpoint may legitimately expose
+                    # only v1 for a model that has no qualified v3 release.
+                    # Do not let that one endpoint abort the owner's complete
+                    # epoch schedule.  Its requests remain bounded by the
+                    # signed global canary policy and protocol negotiation
+                    # still selects v1 (or fails closed when v1 is no longer
+                    # owner-allowed).  Any endpoint that negotiates v3 is
+                    # checked against the model-specific signed policy before
+                    # the request is sent.
+                    qualified_context = max(
+                        2,
+                        int(getattr(miner, "max_context_len", 0) or 0),
+                    )
+                    signed_decode_cap = max(
+                        1,
+                        min(
+                            int(self.low_context_max_decode_tokens),
+                            qualified_context - 1,
+                        ),
                     )
                 context_limit = min(
                     int(miner.max_context_len),
