@@ -533,7 +533,11 @@ def _rmsnorm_saturation_aware_interval(
     norm_scale: float,
     norm_gain_offset: float,
     epsilon: float,
-) -> tuple[tuple[float, float], dict[int, tuple[float, float]]]:
+) -> tuple[
+    tuple[float, float],
+    dict[int, tuple[float, float]],
+    dict[int, tuple[float, float]],
+]:
     """Bound RMSNorm when a committed int8 source row hits a rail.
 
     A rail value represents a half-infinite interval, not the ordinary
@@ -544,8 +548,10 @@ def _rmsnorm_saturation_aware_interval(
     gives a finite, conservative denominator interval without a fitted
     tolerance or an additional wire opening.
 
-    Saturated target cells and gains whose interval crosses zero are refused:
-    they cannot give a finite authenticated bound.
+    A gain interval that crosses zero cannot be inverted.  For that case the
+    exact RMSNorm identity still gives ``abs(source / rms) <= sqrt(width)``;
+    use that model-independent interval directly instead of dividing by a
+    near-zero gain.
     """
 
     import numpy as np
@@ -573,6 +579,7 @@ def _rmsnorm_saturation_aware_interval(
                 epsilon=epsilon,
             ),
             {},
+            {},
         )
 
     source_half = 0.5 * source_scale
@@ -584,8 +591,10 @@ def _rmsnorm_saturation_aware_interval(
     square_max_sum = float(np.square(magnitudes + source_half).sum())
 
     ratio_intervals: dict[int, tuple[float, float]] = {}
+    direct_output_intervals: dict[int, tuple[float, float]] = {}
     ratio_square_min = 0.0
     ratio_square_max = 0.0
+    rail_square_min_sum = 0.0
     for raw_column in saturated:
         column = int(raw_column)
         target_value = int(target[column])
@@ -596,48 +605,66 @@ def _rmsnorm_saturation_aware_interval(
             gain_center - 0.5 * norm_scale,
             gain_center + 0.5 * norm_scale,
         )
+        rail_edge = (
+            126.5 * source_scale
+            if int(source[column]) == 127
+            else -127.5 * source_scale
+        )
+        rail_square_min_sum += rail_edge * rail_edge
         if gain_interval[0] <= 0.0 <= gain_interval[1]:
-            raise _fail(
-                "saturated RMSNorm source has an unbounded norm gain"
-            )
-        target_center = target_value * target_scale
-        if target_value not in (-128, 127):
-            target_interval = (
-                target_center - 0.5 * target_scale,
-                target_center + 0.5 * target_scale,
-            )
-            ratios = tuple(
-                numerator / denominator
-                for numerator in target_interval
-                for denominator in gain_interval
-            )
-            ratio_low, ratio_high = min(ratios), max(ratios)
-        else:
-            # RMSNorm itself gives the model-independent global bound
-            # |source/rms| < sqrt(width).  Combine it with the finite edge of
-            # the target rail; the open side remains conservative and may
-            # yield an infinite denominator upper bound.
             ratio_cap = math.sqrt(len(source))
-            if target_value == 127:
-                target_edge = 126.5 * target_scale
-                edge_ratios = tuple(
-                    target_edge / denominator
+            ratio_low, ratio_high = (
+                (0.0, ratio_cap)
+                if int(source[column]) == 127
+                else (-ratio_cap, 0.0)
+            )
+            output_candidates = tuple(
+                ratio * gain
+                for ratio in (ratio_low, ratio_high)
+                for gain in gain_interval
+            )
+            direct_output_intervals[column] = (
+                min(output_candidates),
+                max(output_candidates),
+            )
+        else:
+            target_center = target_value * target_scale
+            if target_value not in (-128, 127):
+                target_interval = (
+                    target_center - 0.5 * target_scale,
+                    target_center + 0.5 * target_scale,
+                )
+                ratios = tuple(
+                    numerator / denominator
+                    for numerator in target_interval
                     for denominator in gain_interval
                 )
-                if gain_interval[0] > 0.0:
-                    ratio_low, ratio_high = min(edge_ratios), ratio_cap
-                else:
-                    ratio_low, ratio_high = -ratio_cap, max(edge_ratios)
+                ratio_low, ratio_high = min(ratios), max(ratios)
             else:
-                target_edge = -127.5 * target_scale
-                edge_ratios = tuple(
-                    target_edge / denominator
-                    for denominator in gain_interval
-                )
-                if gain_interval[0] > 0.0:
-                    ratio_low, ratio_high = -ratio_cap, max(edge_ratios)
+                # RMSNorm itself gives the model-independent global bound
+                # |source/rms| < sqrt(width).  Combine it with the finite edge
+                # of the target rail; the open side remains conservative.
+                ratio_cap = math.sqrt(len(source))
+                if target_value == 127:
+                    target_edge = 126.5 * target_scale
+                    edge_ratios = tuple(
+                        target_edge / denominator
+                        for denominator in gain_interval
+                    )
+                    if gain_interval[0] > 0.0:
+                        ratio_low, ratio_high = min(edge_ratios), ratio_cap
+                    else:
+                        ratio_low, ratio_high = -ratio_cap, max(edge_ratios)
                 else:
-                    ratio_low, ratio_high = min(edge_ratios), ratio_cap
+                    target_edge = -127.5 * target_scale
+                    edge_ratios = tuple(
+                        target_edge / denominator
+                        for denominator in gain_interval
+                    )
+                    if gain_interval[0] > 0.0:
+                        ratio_low, ratio_high = -ratio_cap, max(edge_ratios)
+                    else:
+                        ratio_low, ratio_high = min(edge_ratios), ratio_cap
         if int(source[column]) == 127:
             ratio_low = max(ratio_low, 0.0)
             if ratio_high <= 0.0:
@@ -660,16 +687,27 @@ def _rmsnorm_saturation_aware_interval(
             / (1.0 - ratio_square_max / width)
         )
     )
-    denominator_interval = (
-        math.sqrt(
+    fixed_point_lower = math.sqrt(
             (square_min_sum / width + epsilon)
             / (1.0 - ratio_square_min / width)
-        ),
+        )
+    rail_lower = math.sqrt(
+        (square_min_sum + rail_square_min_sum) / width + epsilon
+    )
+    denominator_interval = (
+        max(fixed_point_lower, rail_lower),
         denominator_upper,
     )
     denominator_low, denominator_high = denominator_interval
     source_intervals: dict[int, tuple[float, float]] = {}
     for column, (ratio_low, ratio_high) in ratio_intervals.items():
+        if not math.isfinite(denominator_high):
+            source_intervals[column] = (
+                (126.5 * source_scale, math.inf)
+                if int(source[column]) == 127
+                else (-math.inf, -127.5 * source_scale)
+            )
+            continue
         candidates = tuple(
             denominator * ratio
             for denominator in denominator_interval
@@ -685,7 +723,7 @@ def _rmsnorm_saturation_aware_interval(
                 "saturated RMSNorm source is inconsistent with its rail"
             )
         source_intervals[column] = (source_low, source_high)
-    return denominator_interval, source_intervals
+    return denominator_interval, source_intervals, direct_output_intervals
 
 
 def _rmsnorm_quantization_interval(
@@ -5047,12 +5085,14 @@ def verify_economic_recompute_v3(
                     else None
                 )
                 saturated_source_intervals = {}
+                direct_saturated_outputs = {}
                 if exact_source is not None:
                     denominator_interval = None
                 elif any(value in (-128, 127) for value in source_row):
                     (
                         denominator_interval,
                         saturated_source_intervals,
+                        direct_saturated_outputs,
                     ) = _rmsnorm_saturation_aware_interval(
                         source_row=source_row,
                         source_scale=source_scale,
@@ -5091,6 +5131,17 @@ def verify_economic_recompute_v3(
                         _rmsnorm_exact_source_corridor_check(
                             source_values=exact_source,
                             **check_kwargs,
+                        )
+                    elif col in direct_saturated_outputs:
+                        lower, upper = direct_saturated_outputs[col]
+                        _fixed_quantization_corridor_check(
+                            delta=max(lower - got, got - upper, 0.0),
+                            quant=0.5 * target_scale,
+                            relative=_REL_COEFF
+                            * max(abs(lower), abs(upper), abs(got)),
+                            what=check_kwargs["what"],
+                            kind=check_kwargs["kind"],
+                            failure=check_kwargs["failure"],
                         )
                     else:
                         if (
