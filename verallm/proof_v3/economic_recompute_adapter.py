@@ -359,7 +359,11 @@ def _corridor_check(
     else:
         delta = abs(lhs - rhs)
     if stats is not None:
-        stats.append((kind, delta, sigma + extra))
+        # Keep the exact relation label for failure diagnostics.  Acceptance
+        # still aggregates by ``kind`` exactly as before; the extra field is
+        # observational only and lets a retained failing bundle identify the
+        # nonce-selected layer/relation that dominated the statistic.
+        stats.append((kind, delta, sigma + extra, what))
     if _CORRIDOR_REPORT is not None:
         _CORRIDOR_REPORT.append((what, kind, delta, sigma, extra))
         return delta / bound if bound > 0 else 0.0
@@ -4018,7 +4022,7 @@ def verify_economic_recompute_v3(
         )
     import math
 
-    corridor_stats: list[tuple[str, float, float]] = []
+    corridor_stats: list[tuple[str, float, float, str]] = []
     for coupling in proof.couplings:
         layer = coupling.layer_index
         layer_tokens = projection_tokens_by_layer[layer]
@@ -5931,17 +5935,37 @@ def verify_economic_recompute_v3(
     # diluting the signal.
     if corridor_stats and _CORRIDOR_REPORT is None:
         by_kind: dict[str, list[float]] = {}
-        for kind, delta, spread in corridor_stats:
-            by_kind.setdefault(kind, []).append((delta / spread) ** 2)
-        worst = max(sum(values) / len(values) for values in by_kind.values())
+        by_relation: dict[tuple[str, str], list[float]] = {}
+        for kind, delta, spread, relation in corridor_stats:
+            normalized_sq = (delta / spread) ** 2
+            by_kind.setdefault(kind, []).append(normalized_sq)
+            by_relation.setdefault((kind, relation), []).append(
+                normalized_sq
+            )
+        worst_kind, worst = max(
+            (
+                (kind, sum(values) / len(values))
+                for kind, values in by_kind.items()
+            ),
+            key=lambda item: item[1],
+        )
         chi2_cap = _CORRIDOR_CHI2
         manifest_bits = getattr(artifacts.manifest, "corridor_chi2_bits", 0)
         if manifest_bits:
             chi2_cap = bits_to_scale_v3(manifest_bits)
         if worst > chi2_cap:
+            (_relation_kind, worst_relation), relation_values = max(
+                by_relation.items(),
+                key=lambda item: sum(item[1]) / len(item[1]),
+            )
+            relation_mean = sum(relation_values) / len(relation_values)
             raise _fail(
                 "aggregate corridor statistic is outside the honest "
-                "quantization envelope (distributed weight substitution)"
+                "quantization envelope (distributed weight substitution); "
+                f"worst_kind={worst_kind} mean_sq={worst:.9g} "
+                f"cap={chi2_cap:.9g}; worst_relation={worst_relation} "
+                f"relation_mean_sq={relation_mean:.9g} "
+                f"cells={len(relation_values)}"
             )
 
     _profile_mark("transition-couplings")
