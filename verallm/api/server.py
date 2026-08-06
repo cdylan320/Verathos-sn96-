@@ -4723,6 +4723,14 @@ def _proof_v3_execution_capture_requested(args) -> bool:
     )
 
 
+def _proof_execution_capture_modes(args) -> tuple[bool, bool]:
+    """Return (complete trace capture, legacy full-attention state capture)."""
+
+    proof_v2 = _proof_v2_execution_capture_requested(args)
+    proof_v3 = _proof_v3_execution_capture_requested(args)
+    return proof_v2 or proof_v3, proof_v2
+
+
 def _legacy_weight_merkle_startup_required(
     *,
     proof_v3_configured: bool,
@@ -5557,16 +5565,22 @@ def startup(args):
             vllm_kwargs["scheduler_cls"] = (
                 "verallm.miner.proof_cache_scheduler.ProofCacheScheduler"
             )
+    (
+        full_execution_trace_capture,
+        full_attention_state_capture,
+    ) = _proof_execution_capture_modes(args)
     miner.setup_vllm(
         quant=quant,
         gpu_memory_utilization=args.gpu_memory_utilization,
         is_gptq=is_gptq,
         is_awq=is_awq,
         force_awq_gemm_fallback=getattr(args, "awq_gemm_fallback", False),
-        proof_v2_full_trace_capture=(
-            _proof_v2_execution_capture_requested(args)
-            or _proof_v3_execution_capture_requested(args)
-        ),
+        proof_v2_full_trace_capture=full_execution_trace_capture,
+        # Logical paged-K/V boundary capture belongs to the dormant v2
+        # transition statement.  V3 still installs the complete projection,
+        # residual, GDN, attention-reduction and terminal capture path above,
+        # but must not place this Python v2 wrapper in its compiled model.
+        proof_v2_full_attention_state_capture=full_attention_state_capture,
         **vllm_kwargs,
     )
 
