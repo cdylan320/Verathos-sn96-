@@ -4723,12 +4723,23 @@ def _proof_v3_execution_capture_requested(args) -> bool:
     )
 
 
-def _proof_execution_capture_modes(args) -> tuple[bool, bool]:
+def _proof_execution_capture_modes(
+    args,
+    *,
+    allowed_protocol_versions: tuple[int, ...],
+) -> tuple[bool, bool]:
     """Return (complete trace capture, legacy full-attention state capture)."""
 
     proof_v2 = _proof_v2_execution_capture_requested(args)
     proof_v3 = _proof_v3_execution_capture_requested(args)
-    return proof_v2 or proof_v3, proof_v2
+    # Artifact discovery is not protocol activation.  V2 artifacts may still
+    # be listed in a chain config while a v3-only miner runs with protocol 2
+    # explicitly disabled.  Only an allowed v2 wire may install its Python
+    # paged-K/V wrapper into the model compiled by TorchDynamo.
+    return (
+        proof_v2 or proof_v3,
+        proof_v2 and PROOF_PROTOCOL_V2 in allowed_protocol_versions,
+    )
 
 
 def _legacy_weight_merkle_startup_required(
@@ -5568,7 +5579,10 @@ def startup(args):
     (
         full_execution_trace_capture,
         full_attention_state_capture,
-    ) = _proof_execution_capture_modes(args)
+    ) = _proof_execution_capture_modes(
+        args,
+        allowed_protocol_versions=state.allowed_proof_protocol_versions,
+    )
     miner.setup_vllm(
         quant=quant,
         gpu_memory_utilization=args.gpu_memory_utilization,
