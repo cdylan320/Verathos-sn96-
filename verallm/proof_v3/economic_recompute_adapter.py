@@ -292,6 +292,7 @@ def _corridor_check(
     w_sq: float | None = None,
     sigma_cap: float = _CORRIDOR_SIGMA,
     output_quant_floor: float | None = None,
+    captured_is_quantized: bool = True,
 ) -> float:
     """|dequant(surrogate) - dequant(captured)| within the signed corridor.
 
@@ -313,7 +314,15 @@ def _corridor_check(
     import math
 
     lhs = surrogate_value * x_scale * w_scale + bias_value
-    captured_value = int(captured_value)
+    # Most callers open an int8 output oracle, where +/- rails represent a
+    # one-sided interval rather than a point.  The attention runtime bridge
+    # instead supplies an exact decoded BF16/FP16 value.  Do not coerce that
+    # value to int: doing so truncates the authenticated runtime row before
+    # both its per-cell and aggregate corridor checks.
+    if captured_is_quantized:
+        captured_value = int(captured_value)
+    else:
+        captured_value = float(captured_value)
     rhs = captured_value * y_scale
     # per-cell std of the int8 quantization error, propagated:
     #   dx (<= x_scale/2 band, var (x_scale)^2/12) through W  -> sum W_i^2
@@ -330,7 +339,7 @@ def _corridor_check(
     # output int8 half-step (+ the bias reveal's own half-step when the
     # projection carries a manifest-bound bias) + a small relative bf16
     # accumulation allowance
-    captured_on_rail = captured_value in (-128, 127)
+    captured_on_rail = captured_is_quantized and captured_value in (-128, 127)
     floor = (
         0.0
         if captured_on_rail
@@ -343,9 +352,9 @@ def _corridor_check(
     rel = _REL_COEFF * x_scale * w_scale * math.sqrt(x_sq * w_sq)
     extra = floor + rel
     bound = sigma_cap * sigma + extra
-    if captured_value == 127:
+    if captured_is_quantized and captured_value == 127:
         delta = max(126.5 * y_scale - lhs, 0.0)
-    elif captured_value == -128:
+    elif captured_is_quantized and captured_value == -128:
         delta = max(lhs + 127.5 * y_scale, 0.0)
     else:
         delta = abs(lhs - rhs)
@@ -4766,6 +4775,7 @@ def verify_economic_recompute_v3(
                                 abs(raw_value) * relative_step,
                                 2.0 ** -24,
                             ),
+                            captured_is_quantized=False,
                         )
                 replay_k = runtime_kv_head_quantized_v3(
                     tag="k",
@@ -4900,6 +4910,7 @@ def verify_economic_recompute_v3(
                             abs(raw_value) * relative_step,
                             2.0 ** -24,
                         ),
+                        captured_is_quantized=False,
                     )
 
         # --- (c) residual compositions over ALL hidden columns ---
