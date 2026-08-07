@@ -5909,10 +5909,11 @@ class ValidatorNeuron:
                 key,
                 int(source_epoch),
                 endpoint=endpoint,
-                already_on_probation=(
-                    force_penalty
-                    or self._probation_tracker.is_on_probation(key)
-                ),
+                # The new epoch counter is independent of historical
+                # probation.  A follower may force the consequence only when
+                # it consumes an owner snapshot whose negative verdict means
+                # the owner's configured threshold was already reached.
+                already_on_probation=force_penalty,
             )
             self._save_hard_failure_strikes_locked()
         if not penalty:
@@ -5960,10 +5961,7 @@ class ValidatorNeuron:
         key: Tuple[str, int],
     ) -> bool:
         with self._hard_failure_strike_lock:
-            return bool(
-                self._probation_tracker.is_on_probation(key)
-                or self._hard_failure_strikes.penalty_required(key)
-            )
+            return self._hard_failure_strikes.penalty_required(key)
 
     def _clear_hard_failure_strike(
         self,
