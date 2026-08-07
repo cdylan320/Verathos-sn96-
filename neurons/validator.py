@@ -6671,6 +6671,33 @@ class ValidatorNeuron:
             )
         return runnable
 
+    @staticmethod
+    def _active_miner_from_shared_entry(entry) -> ActiveMiner:
+        """Restore a validator-owned fallback entry without dropping identity."""
+
+        return ActiveMiner(
+            address=entry.address,
+            endpoint=entry.endpoint,
+            model_id=entry.model_id,
+            model_index=entry.model_index,
+            quant=entry.quant,
+            max_context_len=entry.max_context_len,
+            hotkey_ss58=str(getattr(entry, "hotkey_ss58", "") or ""),
+            coldkey_ss58=str(getattr(entry, "coldkey_ss58", "") or ""),
+            tee_enabled=bool(getattr(entry, "tee_enabled", False)),
+            tee_platform=str(getattr(entry, "tee_platform", "") or ""),
+            enclave_public_key=str(
+                getattr(entry, "enclave_public_key", "") or ""
+            ),
+            gpu_name=str(getattr(entry, "gpu_name", "") or ""),
+            gpu_count=int(getattr(entry, "gpu_count", 0) or 0),
+            vram_gb=int(getattr(entry, "vram_gb", 0) or 0),
+            compute_capability=str(
+                getattr(entry, "compute_capability", "") or ""
+            ),
+            gpu_uuids=list(getattr(entry, "gpu_uuids", ()) or ()),
+        )
+
     def _do_epoch_setup(self, epoch_start_block: int, epoch_number: int):
         """Heavy epoch setup — runs on a background executor thread."""
         t0 = time.monotonic()
@@ -6693,6 +6720,7 @@ class ValidatorNeuron:
         # Enrich miners with SS58 keys from metagraph (for analytics + shared state)
         self._enrich_miners_from_metagraph(self._epoch_miners)
 
+        used_fallback = False
         if not self._epoch_miners:
             if not discovery_failed:
                 deactivated = self._db.mark_unseen_inactive(epoch_number)
@@ -6712,6 +6740,7 @@ class ValidatorNeuron:
             if previous_miners:
                 self._epoch_miners = previous_miners
                 self._epoch_miners_discovery_valid = False
+                used_fallback = True
                 bt.logging.warning(f"Discovery returned 0 miners — falling back to {len(previous_miners)} miners from previous epoch")
             else:
                 # Fresh start with no previous miners — try shared state
@@ -6720,14 +6749,11 @@ class ValidatorNeuron:
                     shared = read_shared_state(self.config.shared_state_path)
                     if shared and shared.miner_endpoints:
                         self._epoch_miners = [
-                            ActiveMiner(
-                                address=m.address, endpoint=m.endpoint,
-                                model_id=m.model_id, model_index=m.model_index,
-                                quant=m.quant, max_context_len=m.max_context_len,
-                            )
+                            self._active_miner_from_shared_entry(m)
                             for m in shared.miner_endpoints
                         ]
                         self._epoch_miners_discovery_valid = False
+                        used_fallback = True
                         bt.logging.warning(f"Discovery returned 0 miners, no previous epoch — falling back to {len(self._epoch_miners)} miners from shared state")
                 except Exception:
                     pass
@@ -6735,6 +6761,18 @@ class ValidatorNeuron:
                 if not self._epoch_miners:
                     self._canary_scheduler = None
                     return
+
+        if used_fallback:
+            # Prefer a fresh metagraph identity whenever it is reachable. The
+            # fallback values remain intact if this best-effort refresh fails.
+            self._enrich_miners_from_metagraph(self._epoch_miners)
+
+        self._epoch_miners = (
+            self._retain_epoch_miners_with_authenticated_hotkeys(
+                self._epoch_miners,
+                epoch_number=epoch_number,
+            )
+        )
 
         # ── Fast TCP pre-filter: skip dead endpoints entirely ─────────
         # Before spending resources on TLS/HTTP identity challenges, do a
@@ -11646,6 +11684,74 @@ class ValidatorNeuron:
             return entry.get(f"{key_type}_ss58", "")
         return ""
 
+    def _authenticated_miner_hotkey_ss58(
+        self,
+        miner: ActiveMiner,
+        *,
+        uid: Optional[int] = None,
+    ) -> str:
+        """Resolve a miner hotkey only from validator-authenticated state."""
+
+        hotkey = str(getattr(miner, "hotkey_ss58", "") or "")
+        if not hotkey:
+            hotkey = str(self._get_miner_ss58(miner.address, "hotkey") or "")
+        if hotkey or uid is None:
+            return hotkey
+        owner_lookup = getattr(self._db, "get_uid_owner", None)
+        if not callable(owner_lookup):
+            return ""
+        try:
+            owner = owner_lookup(int(uid)) or {}
+        except Exception:
+            return ""
+        if (
+            str(owner.get("evm_address") or "").lower()
+            != str(miner.address).lower()
+        ):
+            return ""
+        return str(owner.get("hotkey_ss58") or "")
+
+    def _retain_epoch_miners_with_authenticated_hotkeys(
+        self,
+        miners: Sequence[ActiveMiner],
+        *,
+        epoch_number: int,
+    ) -> list[ActiveMiner]:
+        """Exclude entries that cannot be bound to an authenticated hotkey."""
+
+        cache = getattr(self, "_ss58_cache", None)
+        if cache is None:
+            cache = {}
+            self._ss58_cache = cache
+        authenticated: list[ActiveMiner] = []
+        missing = 0
+        for miner in miners:
+            try:
+                cached_uid = self._db.get_uid(miner.address)
+            except Exception:
+                cached_uid = None
+            hotkey = self._authenticated_miner_hotkey_ss58(
+                miner,
+                uid=cached_uid,
+            )
+            if not hotkey:
+                missing += 1
+                continue
+            miner.hotkey_ss58 = hotkey
+            cache_entry = cache.setdefault(miner.address.lower(), {})
+            cache_entry["hotkey_ss58"] = hotkey
+            coldkey = str(getattr(miner, "coldkey_ss58", "") or "")
+            if coldkey:
+                cache_entry["coldkey_ss58"] = coldkey
+            authenticated.append(miner)
+        if missing:
+            bt.logging.error(
+                f"Epoch {epoch_number}: excluded {missing} endpoint "
+                "entry/entries before scheduling because no authenticated "
+                "SS58 hotkey was available"
+            )
+        return authenticated
+
     def _stale_uid_identity(
         self,
         miner_address: str,
@@ -12089,26 +12195,10 @@ class ValidatorNeuron:
                 hard_verdict = -1
 
             uid = self._resolve_uid(miner.address)
-            miner_hotkey_ss58 = str(
-                getattr(miner, "hotkey_ss58", "") or ""
+            miner_hotkey_ss58 = self._authenticated_miner_hotkey_ss58(
+                miner,
+                uid=uid,
             )
-            if not miner_hotkey_ss58:
-                hotkey_lookup = getattr(self, "_get_miner_ss58", None)
-                if callable(hotkey_lookup):
-                    miner_hotkey_ss58 = str(
-                        hotkey_lookup(miner.address, "hotkey") or ""
-                    )
-            if not miner_hotkey_ss58 and uid is not None:
-                owner_lookup = getattr(self._db, "get_uid_owner", None)
-                if callable(owner_lookup):
-                    owner = owner_lookup(int(uid)) or {}
-                    if (
-                        str(owner.get("evm_address") or "").lower()
-                        == str(miner.address).lower()
-                    ):
-                        miner_hotkey_ss58 = str(
-                            owner.get("hotkey_ss58") or ""
-                        )
             if not miner_hotkey_ss58:
                 omitted_identity_count += 1
                 continue
