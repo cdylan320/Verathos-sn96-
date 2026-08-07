@@ -973,6 +973,18 @@ class ValidatorNeuron:
         # close transaction single-flight so scoring, EMA updates, the audit
         # log and the weight submission are each produced exactly once.
         self._epoch_close_lock = threading.Lock()
+        # Closing/scoring an epoch may wait for the designated owner's signed
+        # verdict snapshot.  Keep that control-plane wait off the finalized-
+        # block callback so the next epoch can be planned and its canaries can
+        # be dispatched independently.  The worker receives a frozen copy of
+        # every per-epoch input it consumes; it must never read state reset by
+        # the next epoch's setup.
+        self._epoch_close_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="epoch-close",
+        )
+        self._epoch_close_local = threading.local()
+        self._epoch_close_futures: Dict[int, object] = {}
         self._auto_updater = None  # Set by main() if --auto-update
         self._epoch_close_block: int = 0
         self._epoch_close_retry_after: float = 0.0  # monotonic time
@@ -1153,8 +1165,7 @@ class ValidatorNeuron:
 
     def _proof_v3_follower_mode_active(self) -> bool:
         return bool(
-            getattr(
-                self,
+            self._epoch_close_value(
                 "_proof_v3_verdict_source_latched",
                 "verify",
             )
@@ -1167,7 +1178,7 @@ class ValidatorNeuron:
         current_epoch: int | None = None,
         action: str | None = None,
     ) -> bool:
-        cfg = getattr(self, "_maintenance_grace_cfg", None)
+        cfg = self._epoch_close_value("_maintenance_grace_cfg", None)
         if cfg is None:
             base_config = getattr(self, "config", None)
             cfg = (
@@ -1177,7 +1188,7 @@ class ValidatorNeuron:
             )
         epoch = current_epoch
         if epoch is None:
-            epoch = getattr(self, "_current_epoch", None)
+            epoch = self._epoch_close_value("_current_epoch", None)
         if not maintenance_grace_active(cfg, current_epoch=epoch):
             return False
         if action is None:
@@ -1185,7 +1196,7 @@ class ValidatorNeuron:
         return bool(getattr(cfg, action, False))
 
     def _maintenance_grace_reason(self) -> str:
-        cfg = getattr(self, "_maintenance_grace_cfg", None)
+        cfg = self._epoch_close_value("_maintenance_grace_cfg", None)
         if cfg is None:
             base_config = getattr(self, "config", None)
             cfg = (
@@ -1200,7 +1211,7 @@ class ValidatorNeuron:
         *,
         current_epoch: int | None = None,
     ) -> bool:
-        cfg = getattr(self, "_proof_protocol_rollout_cfg", None)
+        cfg = self._epoch_close_value("_proof_protocol_rollout_cfg", None)
         if cfg is None:
             base_config = getattr(self, "config", None)
             cfg = (
@@ -1210,13 +1221,13 @@ class ValidatorNeuron:
             )
         epoch = current_epoch
         if epoch is None:
-            epoch = getattr(self, "_current_epoch", None)
+            epoch = self._epoch_close_value("_current_epoch", None)
         return legacy_v1_compatibility_active(cfg, current_epoch=epoch)
 
     def _proof_v3_required(self) -> bool:
         """Return the proof-version requirement independently of maintenance."""
 
-        cfg = getattr(self, "_proof_protocol_rollout_cfg", None)
+        cfg = self._epoch_close_value("_proof_protocol_rollout_cfg", None)
         if cfg is None:
             base_config = getattr(self, "config", None)
             cfg = (
@@ -1229,7 +1240,7 @@ class ValidatorNeuron:
     def _proof_v3_allowed(self) -> bool:
         """Return whether the epoch-pinned rollout permits proof v3."""
 
-        cfg = getattr(self, "_proof_protocol_rollout_cfg", None)
+        cfg = self._epoch_close_value("_proof_protocol_rollout_cfg", None)
         if cfg is None:
             base_config = getattr(self, "config", None)
             cfg = (
@@ -4153,7 +4164,10 @@ class ValidatorNeuron:
         self,
         epoch_number: Optional[int] = None,
     ) -> bool:
-        cfg = self._capacity_audit_cfg
+        cfg = self._epoch_close_value(
+            "_capacity_audit_cfg",
+            self._capacity_audit_cfg,
+        )
         if not cfg.enabled or cfg.mode not in ("score_gate", "enforce"):
             return False
         if self._maintenance_grace_active(
@@ -4173,7 +4187,12 @@ class ValidatorNeuron:
                         f"{self._maintenance_grace_reason()}"
                     )
             return False
-        if bool(getattr(self, "_subnet_runtime_config_authoritative", False)):
+        if bool(
+            self._epoch_close_value(
+                "_subnet_runtime_config_authoritative",
+                False,
+            )
+        ):
             return True
         if epoch_number is not None:
             logged_epoch = getattr(
@@ -4273,7 +4292,10 @@ class ValidatorNeuron:
         epoch_number: int,
         uid: Optional[int] = None,
     ) -> str:
-        cfg = self._capacity_audit_cfg
+        cfg = self._epoch_close_value(
+            "_capacity_audit_cfg",
+            self._capacity_audit_cfg,
+        )
         if not cfg.enabled or cfg.mode != "score_gate":
             return ""
         if not self._capacity_audit_enforcement_enabled(epoch_number):
@@ -4325,7 +4347,10 @@ class ValidatorNeuron:
         uid: Optional[int],
         epoch_number: int,
     ) -> str:
-        cfg = self._capacity_audit_cfg
+        cfg = self._epoch_close_value(
+            "_capacity_audit_cfg",
+            self._capacity_audit_cfg,
+        )
         if uid is None or not cfg.enabled or cfg.mode != "score_gate":
             return ""
         if not self._capacity_audit_enforcement_enabled(epoch_number):
@@ -4386,15 +4411,18 @@ class ValidatorNeuron:
         if tracker.is_on_probation(key):
             return
         endpoint = ""
-        for miner in getattr(self, "_epoch_miners", []) or []:
+        for miner in self._epoch_close_value("_epoch_miners", ()):
             if (
                 str(getattr(miner, "address", "")).lower() == address.lower()
                 and int(getattr(miner, "model_index", -1)) == int(model_index)
             ):
                 endpoint = str(getattr(miner, "endpoint", "") or "")
                 break
-        tracker.enter_probation(key, self._current_epoch, endpoint=endpoint)
-        self._db.enter_probation(address, model_index, self._current_epoch, uid=int(uid))
+        close_epoch = int(
+            self._epoch_close_value("_current_epoch", self._current_epoch)
+        )
+        tracker.enter_probation(key, close_epoch, endpoint=endpoint)
+        self._db.enter_probation(address, model_index, close_epoch, uid=int(uid))
         self._write_shared_state()
 
     def _apply_capacity_audit_score_gate(
@@ -4554,7 +4582,10 @@ class ValidatorNeuron:
         proof/TEE verified can excuse a hot-capacity timing miss. The receipt
         may be a canary or organic request; miner-reported timing is ignored.
         """
-        cfg = self._capacity_audit_cfg
+        cfg = self._epoch_close_value(
+            "_capacity_audit_cfg",
+            self._capacity_audit_cfg,
+        )
         if not cfg.enabled or cfg.mode not in ("score_gate", "enforce"):
             return 0
         if not self._capacity_audit_enforcement_enabled(epoch_number):
@@ -4659,7 +4690,10 @@ class ValidatorNeuron:
         )
         if callable(follower_mode) and follower_mode():
             return False
-        cfg = self._capacity_audit_cfg
+        cfg = self._epoch_close_value(
+            "_capacity_audit_cfg",
+            self._capacity_audit_cfg,
+        )
         if not cfg.enabled or cfg.mode not in ("score_gate", "enforce"):
             return False
         if self._maintenance_grace_active(
@@ -4738,6 +4772,194 @@ class ValidatorNeuron:
             self._write_shared_state()
         return applied
 
+    def _epoch_close_value(self, name: str, default=None):
+        """Read a frozen old-epoch value while an async close is running."""
+
+        local = getattr(self, "_epoch_close_local", None)
+        state = getattr(local, "state", None) if local is not None else None
+        if state is not None and hasattr(state, name):
+            return getattr(state, name)
+        return getattr(self, name, default)
+
+    def _set_epoch_close_value(self, name: str, value) -> None:
+        """Write close-local state without corrupting the new active epoch."""
+
+        local = getattr(self, "_epoch_close_local", None)
+        state = getattr(local, "state", None) if local is not None else None
+        if state is not None and hasattr(state, name):
+            setattr(state, name, value)
+            return
+        setattr(self, name, value)
+
+    def _capture_epoch_close_state(self, epoch_number: int):
+        """Freeze the complete per-epoch scoring input before rollover."""
+
+        if int(epoch_number) != int(self._current_epoch):
+            raise RuntimeError("cannot freeze a non-current epoch")
+        with self._canary_accounting_lock:
+            expected_obligations = {
+                key: dict(value)
+                for key, value in self._expected_canary_obligations.items()
+            }
+            busy_probations = {
+                key: list(value)
+                for key, value in self._busy_skip_probations.items()
+            }
+            canary_error_times = {
+                key: list(value)
+                for key, value in self._canary_error_times.items()
+            }
+        with self._shared_hard_prefetch_lock:
+            shared_prefetch = dict(self._shared_hard_prefetch_results)
+
+        state = SimpleNamespace(
+            epoch_number=int(epoch_number),
+            _current_epoch=int(epoch_number),
+            _epoch_start_block=int(self._epoch_start_block),
+            _epoch_miners=tuple(self._epoch_miners),
+            _expected_receipts=dict(self._expected_receipts),
+            _expected_canary_obligations=expected_obligations,
+            _hard_canary_obligation_ids=set(self._hard_canary_obligation_ids),
+            _validator_canary_failures=set(self._validator_canary_failures),
+            _canary_penalized_keys=set(self._canary_penalized_keys),
+            _busy_skips=dict(self._busy_skips),
+            _busy_skip_probations=busy_probations,
+            _canary_errors=dict(self._canary_errors),
+            _canary_error_times=canary_error_times,
+            _shared_hard_prefetch_results=shared_prefetch,
+            _shared_hard_proof_verdicts={},
+            _receipt_pull_failed_keys=set(),
+            _scoring=self._scoring,
+            _proof_v3_releases=dict(self._proof_v3_releases),
+            _proof_v3_canary_policy=self._proof_v3_canary_policy,
+            _proof_protocol_rollout_cfg=self._proof_protocol_rollout_cfg,
+            _maintenance_grace_cfg=self._maintenance_grace_cfg,
+            _capacity_audit_cfg=self._capacity_audit_cfg,
+            _proof_v3_verdict_source_latched=str(
+                getattr(
+                    self,
+                    "_proof_v3_verdict_source_latched",
+                    "verify",
+                )
+            ),
+            _owner_verdict_url_latched=str(
+                getattr(self, "_owner_verdict_url_latched", "") or ""
+            ),
+            owner_hotkey_ss58=str(
+                getattr(
+                    self.config,
+                    "proof_v3_hard_auditor_hotkey_ss58",
+                    "",
+                )
+                or ""
+            ),
+            runtime_config_loaded=bool(
+                getattr(
+                    self,
+                    "_subnet_runtime_config_authoritative",
+                    False,
+                )
+            ),
+            _subnet_runtime_config_authoritative=bool(
+                getattr(
+                    self,
+                    "_subnet_runtime_config_authoritative",
+                    False,
+                )
+            ),
+            weight_update_due=bool(self._weight_update_due),
+        )
+        # The due update belongs to this closing epoch. A later boundary may
+        # independently set the live flag again while this close is waiting.
+        self._weight_update_due = False
+        return state
+
+    def _run_queued_epoch_close(self, state) -> None:
+        """Finish one frozen epoch without blocking later block callbacks."""
+
+        epoch_number = int(state.epoch_number)
+        backoff = 30.0
+        local = getattr(self, "_epoch_close_local", None)
+        if local is None:
+            local = threading.local()
+            self._epoch_close_local = local
+        try:
+            while self._running:
+                with self._epoch_close_lock:
+                    if epoch_number <= int(
+                        getattr(self, "_last_closed_epoch", -1)
+                    ):
+                        return
+                    local.state = state
+                    try:
+                        self._closing_inflight_canaries[epoch_number] = dict(
+                            self._inflight_canaries.get(epoch_number, {})
+                        )
+                        try:
+                            self._close_epoch(epoch_number)
+                        finally:
+                            self._closing_inflight_canaries.pop(
+                                epoch_number,
+                                None,
+                            )
+                    except Exception as exc:
+                        bt.logging.warning(
+                            f"Epoch {epoch_number} close failed, retrying in "
+                            f"{backoff:.0f}s without blocking the active epoch: "
+                            f"{exc}"
+                        )
+                    else:
+                        self._last_closed_epoch = epoch_number
+                        if self._pending_epoch_close == epoch_number:
+                            self._pending_epoch_close = None
+                        # The close used its frozen old-epoch scoring policy.
+                        # Restore the active epoch's policy before returning;
+                        # canary setup may have refreshed it while the owner
+                        # snapshot was pending.
+                        active_scoring = getattr(self, "_scoring", None)
+                        if active_scoring is not None:
+                            self.scorer.ema_alpha = active_scoring.ema_alpha
+                            self.scorer.throughput_power = (
+                                active_scoring.throughput_power
+                            )
+                        if bool(state.weight_update_due):
+                            self._schedule_weight_update()
+                        auto_updater = getattr(self, "_auto_updater", None)
+                        if auto_updater is not None:
+                            auto_updater.notify_not_busy()
+                        return
+                    finally:
+                        local.state = None
+                # Keep shutdown responsive and bound each sleep even after
+                # repeated infrastructure failures.
+                deadline = time.monotonic() + backoff
+                while self._running and time.monotonic() < deadline:
+                    time.sleep(min(1.0, deadline - time.monotonic()))
+                backoff = min(backoff * 2.0, 300.0)
+        finally:
+            local.state = None
+            self._epoch_close_futures.pop(epoch_number, None)
+
+    def _queue_epoch_close(self, epoch_number: int) -> bool:
+        """Queue one immutable close and return without waiting for it."""
+
+        epoch_number = int(epoch_number)
+        if epoch_number in self._epoch_close_futures:
+            return False
+        state = self._capture_epoch_close_state(epoch_number)
+        self._epoch_close_futures[epoch_number] = None
+        future = self._epoch_close_executor.submit(
+            self._run_queued_epoch_close,
+            state,
+        )
+        if epoch_number in self._epoch_close_futures:
+            self._epoch_close_futures[epoch_number] = future
+        bt.logging.info(
+            f"Epoch {epoch_number} close queued asynchronously; next-epoch "
+            "canary scheduling remains independent"
+        )
+        return True
+
     def on_finalized_block(
         self,
         block_number: int,
@@ -4802,18 +5024,24 @@ class ValidatorNeuron:
             blocks_into_epoch=blocks_into_epoch,
         )
 
-        # 1. Epoch boundary → start new epoch
+        # 1. Epoch boundary → freeze the old epoch and start the new one.
+        # Receipt reconciliation, owner-snapshot waiting and scoring continue
+        # on the dedicated close worker. They must never delay the next
+        # epoch's setup or canary dispatch.
         if block_number % epoch_blocks == 0:
             if self._pending_epoch_close is None:
                 self._start_new_epoch(block_number)
             else:
+                closing_epoch = int(self._pending_epoch_close)
                 bt.logging.info(
-                    f"Epoch {self._pending_epoch_close} reached its boundary; "
-                    "closing before the next epoch starts"
+                    f"Epoch {closing_epoch} reached its boundary; freezing "
+                    "its close state before the next epoch starts"
                 )
                 self._seal_canary_epoch_for_close(
-                    self._pending_epoch_close
+                    closing_epoch
                 )
+                self._queue_epoch_close(closing_epoch)
+                self._start_new_epoch(block_number)
 
         # 1b. Retry failed epoch start — skip while background setup is in flight.
         elif (
@@ -4845,16 +5073,6 @@ class ValidatorNeuron:
                         f"proof={t.verify_proof} tokens={t.max_new_tokens}",
                     )
                 self._dispatch_canary_tests(pending)
-
-        # 3. Epoch close: canaries have already reserved their complete
-        # inference/proof/verification budget and never consume close grace.
-        if (self._pending_epoch_close is not None
-                and block_number >= self._epoch_close_block):
-            closing_epoch = self._pending_epoch_close
-            if self._try_close_epoch(closing_epoch):
-                current_epoch = block_number // epoch_blocks
-                if current_epoch > closing_epoch:
-                    self._start_new_epoch(block_number - blocks_into_epoch)
 
         self._schedule_miner_debug_refresh(
             current_epoch=block_number // max(1, int(epoch_blocks)),
@@ -4892,7 +5110,15 @@ class ValidatorNeuron:
 
         if not weights and not (model_bucket_mode and model_unallocated > 0):
             return
-        emission_burn = max(0.0, min(1.0, self._scoring.emission_burn))
+        scoring = self._epoch_close_value(
+            "_scoring",
+            getattr(self, "_scoring", ScoringParams()),
+        )
+        # An asynchronous close may overlap the next epoch's runtime-config
+        # refresh.  The weight vector must retain the closing epoch's signed
+        # emission policy, not whichever policy is active when its owner
+        # snapshot finally arrives.
+        emission_burn = max(0.0, min(1.0, scoring.emission_burn))
         if model_bucket_mode:
             # In bucket mode, blacklisted and unserved model shares are
             # burned. Renormalizing them would leak that budget back to
@@ -5455,7 +5681,8 @@ class ValidatorNeuron:
     def _effective_expected_receipts(self, epoch_number: int, key: Tuple[str, int]) -> int:
         """Return the exact preplanned obligation count for an epoch."""
         key = self._miner_model_key(key[0], key[1])
-        return max(0, self._expected_receipts.get(key, 0))
+        expected = self._epoch_close_value("_expected_receipts", {})
+        return max(0, expected.get(key, 0))
 
     @staticmethod
     def _canary_debt_key(key: Tuple[str, int]) -> str:
@@ -6074,7 +6301,7 @@ class ValidatorNeuron:
 
         exact: Dict[Tuple[str, str, int], List[ActiveMiner]] = {}
         identity: Dict[Tuple[str, str], List[ActiveMiner]] = {}
-        for miner in self._epoch_miners:
+        for miner in self._epoch_close_value("_epoch_miners", ()):
             address = str(miner.address).lower()
             model_id = str(miner.model_id)
             exact.setdefault(
@@ -6262,7 +6489,10 @@ class ValidatorNeuron:
         ]
         if not observed:
             return False
-        records = self._busy_skip_probations.get(key, [])
+        records = self._epoch_close_value(
+            "_busy_skip_probations",
+            {},
+        ).get(key, [])
         for obligation_id in missing_full:
             windows = [
                 (start, end)
@@ -7440,9 +7670,18 @@ class ValidatorNeuron:
     def _proof_v3_quant_qualified(self, miner: ActiveMiner) -> bool:
         """Check the advertised quant against the authenticated v3 release."""
 
-        release = getattr(self, "_proof_v3_releases", {}).get(miner.model_id)
-        policy = getattr(self, "_proof_v3_canary_policy", None)
-        rollout = getattr(self, "_proof_protocol_rollout_cfg", None)
+        release = self._epoch_close_value(
+            "_proof_v3_releases",
+            {},
+        ).get(miner.model_id)
+        policy = self._epoch_close_value(
+            "_proof_v3_canary_policy",
+            None,
+        )
+        rollout = self._epoch_close_value(
+            "_proof_protocol_rollout_cfg",
+            None,
+        )
         if rollout is None:
             rollout = proof_protocol_rollout_config_from_neuron_config(
                 self.config
@@ -8565,6 +8804,12 @@ class ValidatorNeuron:
     # Epoch duration in seconds — 360 blocks × 12s = 4320s ≈ 72 min.
     # Used by the restart-forgiveness window (2 epochs).
     _EPOCH_DURATION_SEC = 360 * 12
+    # A healthy owner may need receipt reconciliation and cryptographic replay
+    # before its immutable snapshot exists. Followers wait generously, but on
+    # the dedicated old-epoch close worker: current-epoch scheduling never
+    # waits on this timeout. Exhaustion is fail-neutral/generous.
+    _FOLLOWER_OWNER_CLOSE_TIMEOUT_SEC = 180.0
+    _FOLLOWER_OWNER_CLOSE_RETRY_CAP_SEC = 5.0
 
     def _poll_remote_miner_version(self) -> None:
         """Detect a remote ``miner_version`` bump and open a forgiveness window.
@@ -8637,8 +8882,25 @@ class ValidatorNeuron:
         4. Post demand scores on-chain.
         """
         t0 = time.monotonic()
+        epoch_miners = tuple(
+            self._epoch_close_value("_epoch_miners", ())
+        )
+        expected_obligations_by_key = self._epoch_close_value(
+            "_expected_canary_obligations",
+            {},
+        )
+        validator_canary_failures = self._epoch_close_value(
+            "_validator_canary_failures",
+            set(),
+        )
+        canary_penalized_keys = self._epoch_close_value(
+            "_canary_penalized_keys",
+            set(),
+        )
+        busy_skips = self._epoch_close_value("_busy_skips", {})
+        scoring = self._epoch_close_value("_scoring", self._scoring)
         bt.logging.info(
-            f"Epoch {epoch_number} closing: pulling receipts from {len(self._epoch_miners)} miners",
+            f"Epoch {epoch_number} closing: pulling receipts from {len(epoch_miners)} miners",
         )
 
         # Detect a remote miner_version bump and (re-)open the restart-
@@ -8648,10 +8910,22 @@ class ValidatorNeuron:
         except Exception as e:
             bt.logging.debug(f"miner_version poll failed: {e}")
 
-        runtime_config_loaded = self._refresh_subnet_runtime_config(
-            current_epoch=epoch_number,
-            force=True,
+        close_state = getattr(
+            getattr(self, "_epoch_close_local", None),
+            "state",
+            None,
         )
+        if close_state is not None:
+            # The old epoch already latched an authenticated runtime config at
+            # setup. A concurrent new-epoch refresh must not rewrite its
+            # scoring semantics while its close waits for the owner.
+            runtime_config_loaded = True
+        else:
+            runtime_config_loaded = self._refresh_subnet_runtime_config(
+                current_epoch=epoch_number,
+                force=True,
+            )
+            scoring = self._scoring
 
         # ── Build the validator authority snapshot for receipt verification.
         # Done ONCE per epoch close so the per-receipt loop is pure dict +
@@ -8719,7 +8993,7 @@ class ValidatorNeuron:
                 )
 
         # ── Pass 1: collect all receipts ──────────────────────────
-        self._receipt_pull_failed_keys: Set[Tuple[str, int]] = set()
+        self._set_epoch_close_value("_receipt_pull_failed_keys", set())
         miner_receipts, all_epoch_receipts = self._collect_epoch_receipts(
             epoch_number, receipt_authority,
         )
@@ -8740,20 +9014,24 @@ class ValidatorNeuron:
                 current_epoch=epoch_number,
             )
         )
-        self._shared_hard_proof_verdicts = dict(
+        shared_hard_proof_verdicts = dict(
             current_shared_hard_verdicts
         )
         for key, verdict in late_shared_hard_verdicts.items():
             # Any independently verified failure dominates a pass; otherwise
             # the newest unprocessed late pass supplies the current security
             # verdict without changing the closed epoch's throughput.
-            if verdict is False or key not in self._shared_hard_proof_verdicts:
-                self._shared_hard_proof_verdicts[key] = verdict
+            if verdict is False or key not in shared_hard_proof_verdicts:
+                shared_hard_proof_verdicts[key] = verdict
         # Positive owner-signed failure evidence always dominates a retained
         # pass. The owner refuses to publish both for one obligation; treating
         # any inconsistency conservatively prevents a downgrade.
         for key in shared_hard_failure_verdicts:
-            self._shared_hard_proof_verdicts[key] = False
+            shared_hard_proof_verdicts[key] = False
+        self._set_epoch_close_value(
+            "_shared_hard_proof_verdicts",
+            shared_hard_proof_verdicts,
+        )
 
         # ── Store all receipts (full network view) ────────────────
         try:
@@ -8791,53 +9069,57 @@ class ValidatorNeuron:
         # only when no hosted config/cache is usable.
         if runtime_config_loaded:
             bt.logging.debug(
-                f"Runtime subnet config scoring: tee={self._scoring.tee_bonus:.2f} "
-                f"ema={self._scoring.ema_alpha:.2f} tp={self._scoring.throughput_power:.1f} "
-                f"proof_rate={self._scoring.proof_sample_rate:.2f} "
-                f"prob_passes={self._scoring.probation_required_passes} "
-                f"demand_max={self._scoring.demand_bonus_max:.2f} "
-                f"burn={self._scoring.emission_burn:.0%}"
+                f"Runtime subnet config scoring: tee={scoring.tee_bonus:.2f} "
+                f"ema={scoring.ema_alpha:.2f} tp={scoring.throughput_power:.1f} "
+                f"proof_rate={scoring.proof_sample_rate:.2f} "
+                f"prob_passes={scoring.probation_required_passes} "
+                f"demand_max={scoring.demand_bonus_max:.2f} "
+                f"burn={scoring.emission_burn:.0%}"
             )
         elif self._subnet_config_client is not None:
             try:
-                self._scoring = self._subnet_config_client.get_scoring_params()
-                self._last_good_scoring = self._scoring  # cache for fallback
+                scoring = self._subnet_config_client.get_scoring_params()
+                self._scoring = scoring
+                self._last_good_scoring = scoring  # cache for fallback
                 bt.logging.debug(
-                    f"SubnetConfig fallback scoring: tee={self._scoring.tee_bonus:.2f} "
-                    f"ema={self._scoring.ema_alpha:.2f} tp={self._scoring.throughput_power:.1f} "
-                    f"proof_rate={self._scoring.proof_sample_rate:.2f} "
-                    f"prob_passes={self._scoring.probation_required_passes} "
-                    f"demand_max={self._scoring.demand_bonus_max:.2f} "
-                    f"burn={self._scoring.emission_burn:.0%}"
+                    f"SubnetConfig fallback scoring: tee={scoring.tee_bonus:.2f} "
+                    f"ema={scoring.ema_alpha:.2f} tp={scoring.throughput_power:.1f} "
+                    f"proof_rate={scoring.proof_sample_rate:.2f} "
+                    f"prob_passes={scoring.probation_required_passes} "
+                    f"demand_max={scoring.demand_bonus_max:.2f} "
+                    f"burn={scoring.emission_burn:.0%}"
                 )
             except Exception as e:
                 if hasattr(self, "_last_good_scoring"):
-                    self._scoring = self._last_good_scoring
-                    bt.logging.info(f"SubnetConfig read failed, using last-known values (burn={self._scoring.emission_burn:.0%}): {e}")
+                    scoring = self._last_good_scoring
+                    self._scoring = scoring
+                    bt.logging.info(f"SubnetConfig read failed, using last-known values (burn={scoring.emission_burn:.0%}): {e}")
                 else:
-                    self._scoring = ScoringParams()  # hardcoded defaults on first-ever failure
+                    scoring = ScoringParams()
+                    self._scoring = scoring  # hardcoded defaults on first-ever failure
                     bt.logging.info(f"SubnetConfig read failed, no cache, using defaults: {e}")
         else:
             if not hasattr(self, "_last_good_scoring"):
-                self._scoring = ScoringParams()
+                scoring = ScoringParams()
+                self._scoring = scoring
 
         # Update scorer EMA alpha + throughput power from chain
-        self.scorer.ema_alpha = self._scoring.ema_alpha
-        self.scorer.throughput_power = self._scoring.throughput_power
+        self.scorer.ema_alpha = scoring.ema_alpha
+        self.scorer.throughput_power = scoring.throughput_power
 
         self._last_model_emission_budgets = self._build_model_emission_budgets(
             demand_scores,
         )
 
         # Refresh blacklist from SubnetConfig (parallel RPC per address, cached 5min).
-        self._refresh_blacklist({m.address for m in self._epoch_miners})
+        self._refresh_blacklist({m.address for m in epoch_miners})
 
         # ── GPU UUID dedup: one GPU = one endpoint ─────────────────
         # Build map: gpu_uuid -> list of (address, model_index, ema_score).
         # If any UUID appears on more than one endpoint, keep the highest-
         # scored, skip the rest.  One physical GPU can only serve one endpoint.
         _uuid_endpoints: Dict[str, List[tuple]] = {}
-        for m in self._epoch_miners:
+        for m in epoch_miners:
             for _uuid in getattr(m, "gpu_uuids", []):
                 if not _uuid:
                     continue
@@ -8885,7 +9167,7 @@ class ValidatorNeuron:
                     )
 
         # ── Pass 2: score each miner-model entry ─────────────────
-        for miner in self._epoch_miners:
+        for miner in epoch_miners:
             if not self._running:
                 break
 
@@ -8952,7 +9234,10 @@ class ValidatorNeuron:
                 epoch_number,
             )
 
-            if key in getattr(self, "_receipt_pull_failed_keys", set()):
+            if key in self._epoch_close_value(
+                "_receipt_pull_failed_keys",
+                set(),
+            ):
                 # The peer receipt endpoint is distribution only. Our signed
                 # receipts were persisted before transport and remain
                 # authoritative for our exact canary obligations. Continuing
@@ -8965,7 +9250,7 @@ class ValidatorNeuron:
                     "receipts and exact missing obligations"
                 )
 
-            if key in self._validator_canary_failures:
+            if key in validator_canary_failures:
                 gated = self._apply_capacity_audit_model_gate(
                     miner.address,
                     miner.model_index,
@@ -8987,7 +9272,7 @@ class ValidatorNeuron:
                     )
                 continue
 
-            busy_skips_this_epoch = self._busy_skips.get(key, 0)
+            busy_skips_this_epoch = busy_skips.get(key, 0)
             if expected == 0 and busy_skips_this_epoch == 0:
                 gated = self._apply_capacity_audit_model_gate(
                     miner.address,
@@ -9007,7 +9292,7 @@ class ValidatorNeuron:
                 continue
 
             expected_inventory = dict(
-                self._expected_canary_obligations.get(key, {})
+                expected_obligations_by_key.get(key, {})
             )
             completed_obligations = self._completed_canary_obligations(
                 own_receipts,
@@ -9064,8 +9349,7 @@ class ValidatorNeuron:
                 missing_low or (missing_full and not full_deferred)
             )
             if obligation_failure:
-                hard_ids = getattr(
-                    self,
+                hard_ids = self._epoch_close_value(
                     "_hard_canary_obligation_ids",
                     set(),
                 )
@@ -9081,13 +9365,13 @@ class ValidatorNeuron:
                         failure_code="obligation_missing",
                     )
             if obligation_failure and not suppress_probation:
-                if key not in self._canary_penalized_keys:
+                if key not in canary_penalized_keys:
                     self._on_proof_failure(
                         miner.address,
                         miner.model_index,
                         endpoint=getattr(miner, "endpoint", ""),
                     )
-                    self._canary_penalized_keys.add(key)
+                    canary_penalized_keys.add(key)
                 bt.logging.info(
                     f"Canary obligation failure for {miner.address[:10]} "
                     f"model_index={miner.model_index}: "
@@ -9103,7 +9387,7 @@ class ValidatorNeuron:
             proof_failed = [
                 r for r in proof_tested if not r.proof_verified
             ]
-            shared_hard_verdict = self._shared_hard_proof_verdicts.get(key)
+            shared_hard_verdict = shared_hard_proof_verdicts.get(key)
             shared_hard_tests = 1 if shared_hard_verdict is not None else 0
             shared_hard_failures = (
                 1 if shared_hard_verdict is False else 0
@@ -9131,7 +9415,7 @@ class ValidatorNeuron:
                 max_context_len=miner.max_context_len,
                 quant=miner.quant,
                 quant_qualified=self._proof_v3_quant_qualified(miner),
-                busy_skip_count=self._busy_skips.get(key, 0),
+                busy_skip_count=busy_skips.get(key, 0),
             )
 
             # Demand bonus for this model
@@ -9139,7 +9423,7 @@ class ValidatorNeuron:
             if self.config.demand_bonus_enabled:
                 model_bps = demand_scores.get(miner.model_id, 0)
                 demand_bonus = compute_demand_bonus(
-                    model_bps, self._scoring.demand_bonus_max,
+                    model_bps, scoring.demand_bonus_max,
                 )
 
             suppress_score_zeroing = self._maintenance_grace_active(
@@ -9156,7 +9440,7 @@ class ValidatorNeuron:
                 generation_quality=model_entry.generation_quality,
                 demand_bonus=demand_bonus,
                 peer_medians=peer_medians_by_model.get(miner.model_id),
-                tee_bonus=self._scoring.tee_bonus,
+                tee_bonus=scoring.tee_bonus,
                 suppress_hard_failures=suppress_score_zeroing,
             )
             gated = self._apply_capacity_audit_model_gate(
@@ -9275,7 +9559,7 @@ class ValidatorNeuron:
         # leave the network.  Transient issues (unreachable but still
         # discovered) are handled by the canary error penalty path above.
         _discovered_keys = {
-            (m.address.lower(), m.model_index) for m in self._epoch_miners
+            (m.address.lower(), m.model_index) for m in epoch_miners
         }
         self._full_context_debt = {
             key: debt_epoch
@@ -9378,8 +9662,10 @@ class ValidatorNeuron:
         weight_set = False  # weights are set on a separate boundary
         self._db.log_epoch(
             epoch=epoch_number,
-            start_block=self._epoch_start_block,
-            miner_count=len(self._epoch_miners),
+            start_block=int(
+                self._epoch_close_value("_epoch_start_block", 0)
+            ),
+            miner_count=len(epoch_miners),
             receipt_count=len(all_epoch_receipts),
             weight_set=weight_set,
         )
@@ -9388,7 +9674,12 @@ class ValidatorNeuron:
         try:
             cleanup = self._db.compact_capacity_audit_storage(
                 current_epoch=int(epoch_number),
-                retain_failure_epochs=int(self._capacity_audit_cfg.repeat_window_epochs) + 2,
+                retain_failure_epochs=int(
+                    self._epoch_close_value(
+                        "_capacity_audit_cfg",
+                        self._capacity_audit_cfg,
+                    ).repeat_window_epochs
+                ) + 2,
                 retain_artifacts=os.environ.get(
                     "VERATHOS_CAPACITY_AUDIT_RETAIN_ARTIFACTS",
                     "",
@@ -9452,8 +9743,7 @@ class ValidatorNeuron:
             receipt_key,
         )
         with lock:
-            return getattr(
-                self,
+            return self._epoch_close_value(
                 "_shared_hard_prefetch_results",
                 {},
             ).get(cache_key)
@@ -9484,16 +9774,20 @@ class ValidatorNeuron:
             receipt_key,
         )
         with self._shared_hard_prefetch_lock:
-            existing = self._shared_hard_prefetch_results.get(cache_key)
+            results = self._epoch_close_value(
+                "_shared_hard_prefetch_results",
+                {},
+            )
+            existing = results.get(cache_key)
             value = (status, str(detail or ""))
             if existing is not None and existing != value:
                 # A deterministic replay cannot legitimately change verdict.
-                self._shared_hard_prefetch_results[cache_key] = (
+                results[cache_key] = (
                     "peer",
                     "retained hard bundle changed across fetches",
                 )
             else:
-                self._shared_hard_prefetch_results[cache_key] = value
+                results[cache_key] = value
 
     def _prefetch_shared_hard_bundle(
         self,
@@ -9513,10 +9807,14 @@ class ValidatorNeuron:
         from verallm.chain.wallet import ss58_decode
 
         try:
-            release = getattr(self, "_proof_v3_releases", {}).get(
-                miner.model_id
+            release = self._epoch_close_value(
+                "_proof_v3_releases",
+                {},
+            ).get(miner.model_id)
+            policy = self._epoch_close_value(
+                "_proof_v3_canary_policy",
+                None,
             )
-            policy = getattr(self, "_proof_v3_canary_policy", None)
             model_policy = (
                 policy.model_policy(miner.model_id)
                 if policy is not None
@@ -9639,25 +9937,40 @@ class ValidatorNeuron:
             # previously succeeded. Keep the anti-replay floor separately.
             follower.clear_current()
         owner_url = str(
-            getattr(self, "_owner_verdict_url_latched", "") or ""
+            self._epoch_close_value(
+                "_owner_verdict_url_latched",
+                "",
+            )
+            or ""
         ).strip()
+        close_state = getattr(
+            getattr(self, "_epoch_close_local", None),
+            "state",
+            None,
+        )
         owner_ss58 = str(
-            getattr(
+            getattr(close_state, "owner_hotkey_ss58", "")
+            if close_state is not None
+            else getattr(
                 self.config,
                 "proof_v3_hard_auditor_hotkey_ss58",
                 "",
             )
             or ""
         )
-        # Owner and follower validators observe the same chain boundary and
-        # normally begin closing at the same time.  Receipt reconciliation and
-        # signing can keep the owner's current-epoch snapshot unavailable for
-        # several seconds, so a sub-second retry window systematically races
-        # the owner.  Keep this bounded: an unavailable owner remains neutral,
-        # but a healthy owner gets enough time to finish an ordinary close.
-        attempts = 8 if at_close else 1
+        # Owner and follower validators observe the same chain boundary. The
+        # follower's old-epoch worker polls for a bounded wall-clock interval;
+        # this wait never occupies the finalized-block callback or delays the
+        # next epoch's canary scheduler. An unavailable owner stays neutral.
+        started = time.monotonic()
+        timeout_s = (
+            float(self._FOLLOWER_OWNER_CLOSE_TIMEOUT_SEC)
+            if at_close
+            else 0.0
+        )
+        attempt = 0
         last_error: Exception | None = None
-        for attempt in range(attempts):
+        while True:
             try:
                 if not owner_url:
                     raise VerdictSnapshotUnavailable(
@@ -9701,8 +10014,21 @@ class ValidatorNeuron:
                 return snapshot
             except VerdictSnapshotUnavailable as exc:
                 last_error = exc
-                if attempt + 1 < attempts:
-                    time.sleep(min(1.0, 0.25 * (1 << attempt)))
+                if not at_close:
+                    break
+                elapsed = time.monotonic() - started
+                remaining = timeout_s - elapsed
+                if remaining <= 0:
+                    break
+                delay = min(
+                    float(self._FOLLOWER_OWNER_CLOSE_RETRY_CAP_SEC),
+                    0.25 * (1 << min(attempt, 5)),
+                    remaining,
+                )
+                if delay <= 0:
+                    break
+                time.sleep(delay)
+                attempt += 1
         if at_close:
             follower.clear_current()
             bt.logging.warning(
@@ -9731,7 +10057,7 @@ class ValidatorNeuron:
         miner = next(
             (
                 value
-                for value in self._epoch_miners
+                for value in self._epoch_close_value("_epoch_miners", ())
                 if self._miner_model_key(
                     value.address,
                     value.model_index,
@@ -9765,7 +10091,8 @@ class ValidatorNeuron:
         if snapshot is None:
             return {}
         verdicts: Dict[Tuple[str, int], bool] = {}
-        for miner in self._epoch_miners:
+        epoch_miners = self._epoch_close_value("_epoch_miners", ())
+        for miner in epoch_miners:
             entry = self._follower_verdict_entry(
                 miner.address,
                 miner.model_index,
@@ -9782,7 +10109,7 @@ class ValidatorNeuron:
             "Follower owner verdict apply: "
             f"pass={sum(value is True for value in verdicts.values())} "
             f"failure={sum(value is False for value in verdicts.values())} "
-            f"neutral={len(self._epoch_miners) - len(verdicts)}"
+            f"neutral={len(epoch_miners) - len(verdicts)}"
         )
         return verdicts
 
@@ -9972,7 +10299,8 @@ class ValidatorNeuron:
             Tuple[str, int, str],
             tuple[ActiveMiner, tuple[ServiceReceipt, ...]],
         ] = {}
-        for miner in self._epoch_miners:
+        epoch_miners = self._epoch_close_value("_epoch_miners", ())
+        for miner in epoch_miners:
             receipts = tuple(
                 receipt
                 for receipt in miner_receipts.get(miner.address, ())
@@ -10000,7 +10328,10 @@ class ValidatorNeuron:
         )
         if not real_epoch_seed:
             for miner, _receipts in work.values():
-                self._validator_canary_failures.add(
+                self._epoch_close_value(
+                    "_validator_canary_failures",
+                    set(),
+                ).add(
                     self._miner_model_key(
                         miner.address,
                         miner.model_index,
@@ -10028,10 +10359,14 @@ class ValidatorNeuron:
             item: tuple[ActiveMiner, tuple[ServiceReceipt, ...]],
         ) -> tuple[str, str]:
             miner, receipts = item
-            release = getattr(self, "_proof_v3_releases", {}).get(
-                miner.model_id
+            release = self._epoch_close_value(
+                "_proof_v3_releases",
+                {},
+            ).get(miner.model_id)
+            policy = self._epoch_close_value(
+                "_proof_v3_canary_policy",
+                None,
             )
-            policy = getattr(self, "_proof_v3_canary_policy", None)
             model_policy = (
                 policy.model_policy(miner.model_id)
                 if policy is not None
@@ -10181,7 +10516,10 @@ class ValidatorNeuron:
                     )
                 else:
                     local_failures += 1
-                    self._validator_canary_failures.add(key)
+                    self._epoch_close_value(
+                        "_validator_canary_failures",
+                        set(),
+                    ).add(key)
                     bt.logging.warning(
                         "Shared proof-v3 hard verification failed locally "
                         f"(NOT attributed to miner {miner.address[:10]} "
@@ -10196,7 +10534,7 @@ class ValidatorNeuron:
             f"Shared proof-v3 hard replay: pass="
             f"{sum(value is True for value in verdicts.values())} "
             f"peer_failure={peer_failures} local_failure={local_failures} "
-            f"neutral={len(self._epoch_miners) - len(work)}"
+            f"neutral={len(epoch_miners) - len(work)}"
         )
         return verdicts
 
@@ -10263,11 +10601,15 @@ class ValidatorNeuron:
         )
         verdicts: Dict[Tuple[str, int], bool] = {}
         local_failures = 0
-        for miner in self._epoch_miners:
-            release = getattr(self, "_proof_v3_releases", {}).get(
-                miner.model_id
+        for miner in self._epoch_close_value("_epoch_miners", ()):
+            release = self._epoch_close_value(
+                "_proof_v3_releases",
+                {},
+            ).get(miner.model_id)
+            policy = self._epoch_close_value(
+                "_proof_v3_canary_policy",
+                None,
             )
-            policy = getattr(self, "_proof_v3_canary_policy", None)
             model_policy = (
                 policy.model_policy(miner.model_id)
                 if policy is not None
@@ -10471,8 +10813,14 @@ class ValidatorNeuron:
             )
             all_epoch_receipts.append(receipt)
 
-        if not self._epoch_miners:
-            self._receipt_pull_failed_keys = pull_failed_keys
+        epoch_miners = tuple(
+            self._epoch_close_value("_epoch_miners", ())
+        )
+        if not epoch_miners:
+            self._set_epoch_close_value(
+                "_receipt_pull_failed_keys",
+                pull_failed_keys,
+            )
             return miner_receipts, all_epoch_receipts
 
         # Receipt close is a scoring-critical phase. Do not submit these jobs
@@ -10480,7 +10828,7 @@ class ValidatorNeuron:
         # leave all receipt pulls queued until the overall timeout fires.
         receipt_workers = max(
             1,
-            min(self.config.max_concurrent_verifications, len(self._epoch_miners)),
+            min(self.config.max_concurrent_verifications, len(epoch_miners)),
         )
         receipt_executor = ThreadPoolExecutor(
             max_workers=receipt_workers,
@@ -10488,7 +10836,7 @@ class ValidatorNeuron:
         )
         receipt_futures = {}
         try:
-            for miner in self._epoch_miners:
+            for miner in epoch_miners:
                 if not self._running:
                     break
                 receipt_futures[
@@ -10501,7 +10849,7 @@ class ValidatorNeuron:
             # floored by config, capped at 120s.
             _rp_timeout = min(120, max(
                 self.config.epoch_receipt_pull_overall_timeout,
-                len(self._epoch_miners) // self.config.max_concurrent_verifications * 3 + 10,
+                len(epoch_miners) // self.config.max_concurrent_verifications * 3 + 10,
             ))
             # Cross-pull signature dedup: when a miner registers multiple
             # model_indices on a single physical server, every endpoint returns
@@ -10559,7 +10907,10 @@ class ValidatorNeuron:
         finally:
             receipt_executor.shutdown(wait=False, cancel_futures=True)
 
-        self._receipt_pull_failed_keys = pull_failed_keys
+        self._set_epoch_close_value(
+            "_receipt_pull_failed_keys",
+            pull_failed_keys,
+        )
         return miner_receipts, all_epoch_receipts
 
     def _pull_epoch_receipts(
@@ -10894,10 +11245,13 @@ class ValidatorNeuron:
             _ss58 = self._get_miner_ss58(miner_address, "hotkey") or ""
         except Exception:
             pass
+        close_epoch = int(
+            self._epoch_close_value("_current_epoch", self._current_epoch)
+        )
         if not self._probation_tracker.is_on_probation(key):
-            self._probation_tracker.enter_probation(key, self._current_epoch, endpoint=endpoint)
+            self._probation_tracker.enter_probation(key, close_epoch, endpoint=endpoint)
             self._db.enter_probation(
-                miner_address, model_index, self._current_epoch,
+                miner_address, model_index, close_epoch,
                 uid=_uid, hotkey_ss58=_ss58,
             )
         else:
@@ -11083,7 +11437,7 @@ class ValidatorNeuron:
                 )
         served = {
             m.model_id
-            for m in getattr(self, "_epoch_miners", [])
+            for m in self._epoch_close_value("_epoch_miners", ())
             if get_model(m.model_id) is not None
         }
         if served:
@@ -11125,7 +11479,7 @@ class ValidatorNeuron:
         """Return best observed quant/context pair per model this epoch."""
         observed: Dict[str, Tuple[int, str]] = {}
         observed_score: Dict[str, float] = {}
-        for miner in getattr(self, "_epoch_miners", []):
+        for miner in self._epoch_close_value("_epoch_miners", ()):
             model_entry = get_model(miner.model_id)
             if model_entry is None:
                 continue
@@ -11190,7 +11544,10 @@ class ValidatorNeuron:
             if self.config.demand_bonus_enabled:
                 demand_bonus = compute_demand_bonus(
                     demand_scores.get(model_id, 0),
-                    self._scoring.demand_bonus_max,
+                    self._epoch_close_value(
+                        "_scoring",
+                        self._scoring,
+                    ).demand_bonus_max,
                 )
             variant_budget = base_utility * demand_bonus
             budgets[model_id] = variant_budget
@@ -11700,7 +12057,7 @@ class ValidatorNeuron:
             ) from exc
 
         entries: list[VerdictSnapshotEntryV1] = []
-        for miner in self._epoch_miners:
+        for miner in self._epoch_close_value("_epoch_miners", ()):
             key = self._miner_model_key(
                 miner.address,
                 miner.model_index,
@@ -12624,6 +12981,7 @@ class ValidatorNeuron:
             self._capacity_audit_server.should_exit = True
         self._executor.shutdown(wait=False)
         self._control_executor.shutdown(wait=False)
+        self._epoch_close_executor.shutdown(wait=False)
         self._capacity_audit_executor.shutdown(wait=False)
         self._capacity_audit_discovery_executor.shutdown(wait=False)
         self._capacity_audit_receipt_executor.shutdown(wait=False)
