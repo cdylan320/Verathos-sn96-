@@ -89,6 +89,7 @@ from neurons.config import NeuronConfig
 from neurons.discovery import ActiveMiner, discover_active_miners
 from neurons.subnet_runtime_config import (
     MaintenanceGraceConfig,
+    ProofV3FailurePolicyConfig,
     ProofProtocolRolloutConfig,
     RuntimeSubnetConfigClient,
     apply_runtime_config_to_neuron_config,
@@ -99,6 +100,7 @@ from neurons.subnet_runtime_config import (
     proof_protocol_allowed,
     proof_v3_required,
     proof_protocol_rollout_config_from_neuron_config,
+    proof_v3_failure_policy_config_from_neuron_config,
     select_proof_protocol_version,
 )
 from neurons.model_resolve import validate_capacity_recommended_model
@@ -126,6 +128,7 @@ from neurons.scoring import (
     compute_peer_medians,
 )
 from neurons.validator_db import ValidatorStateDB
+from neurons.proof_v3_failure_strikes import HardProofStrikeTracker
 
 from verallm.chain.config import ChainConfig
 from verallm.chain.mock import create_clients
@@ -766,6 +769,22 @@ class ValidatorNeuron:
         )
         self._db = ValidatorStateDB(db_path=db_path)
 
+        self._proof_v3_failure_policy_cfg = (
+            proof_v3_failure_policy_config_from_neuron_config(config)
+        )
+        self._hard_failure_strike_lock = threading.Lock()
+        self._hard_failure_strikes = HardProofStrikeTracker(
+            failure_epochs_for_penalty=(
+                self._proof_v3_failure_policy_cfg
+                .failure_epochs_for_penalty
+            ),
+            clean_hard_audit_epochs_for_reset=(
+                self._proof_v3_failure_policy_cfg
+                .clean_hard_audit_epochs_for_reset
+            ),
+        )
+        self._load_hard_failure_strikes()
+
         self.evm_pk = ""
         self.evm_addr = ""
         # Set True when validator runs without EVM registration (no on-chain
@@ -1086,7 +1105,20 @@ class ValidatorNeuron:
         self._last_good_scoring = runtime.scoring
         self._capacity_audit_cfg = runtime.capacity_audit
         self._proof_protocol_rollout_cfg = runtime.proof_protocol_rollout
+        self._proof_v3_failure_policy_cfg = runtime.proof_v3_failure_policy
         self._maintenance_grace_cfg = runtime.maintenance_grace
+        with self._hard_failure_strike_lock:
+            self._hard_failure_strikes.configure(
+                failure_epochs_for_penalty=(
+                    runtime.proof_v3_failure_policy
+                    .failure_epochs_for_penalty
+                ),
+                clean_hard_audit_epochs_for_reset=(
+                    runtime.proof_v3_failure_policy
+                    .clean_hard_audit_epochs_for_reset
+                ),
+            )
+            self._save_hard_failure_strikes_locked()
         self._probation_tracker.required_passes = runtime.scoring.probation_required_passes
         self._probation_tracker.escalation_epochs = runtime.probation_escalation_epochs
         for state in getattr(self._probation_tracker, "_probation", {}).values():
@@ -4833,6 +4865,9 @@ class ValidatorNeuron:
             _proof_v3_releases=dict(self._proof_v3_releases),
             _proof_v3_canary_policy=self._proof_v3_canary_policy,
             _proof_protocol_rollout_cfg=self._proof_protocol_rollout_cfg,
+            _proof_v3_failure_policy_cfg=(
+                self._proof_v3_failure_policy_cfg
+            ),
             _maintenance_grace_cfg=self._maintenance_grace_cfg,
             _capacity_audit_cfg=self._capacity_audit_cfg,
             _proof_v3_verdict_source_latched=str(
@@ -5807,6 +5842,137 @@ class ValidatorNeuron:
             )
             self._last_hard_audit_pass_epoch = {}
 
+    def _hard_failure_policy(self) -> ProofV3FailurePolicyConfig:
+        policy = self._epoch_close_value(
+            "_proof_v3_failure_policy_cfg",
+            None,
+        )
+        if isinstance(policy, ProofV3FailurePolicyConfig):
+            return policy
+        return proof_v3_failure_policy_config_from_neuron_config(
+            self.config
+        )
+
+    def _load_hard_failure_strikes(self) -> None:
+        try:
+            raw = self._db.get_meta("proof_v3_hard_failure_strikes_v1")
+            if not raw:
+                return
+            policy = self._proof_v3_failure_policy_cfg
+            self._hard_failure_strikes = HardProofStrikeTracker.from_json(
+                raw,
+                failure_epochs_for_penalty=(
+                    policy.failure_epochs_for_penalty
+                ),
+                clean_hard_audit_epochs_for_reset=(
+                    policy.clean_hard_audit_epochs_for_reset
+                ),
+            )
+        except Exception as exc:
+            # A malformed local ledger must not grant a neutral failure.
+            bt.logging.warning(
+                "Ignoring malformed proof-v3 hard-failure strike ledger; "
+                f"falling back to immediate penalty: {exc}"
+            )
+            self._hard_failure_strikes = HardProofStrikeTracker(
+                failure_epochs_for_penalty=1,
+                clean_hard_audit_epochs_for_reset=3,
+            )
+
+    def _save_hard_failure_strikes_locked(self) -> None:
+        self._db.set_meta(
+            "proof_v3_hard_failure_strikes_v1",
+            self._hard_failure_strikes.to_json(),
+        )
+
+    def _record_hard_failure_strike(
+        self,
+        key: Tuple[str, int],
+        *,
+        source_epoch: int,
+        endpoint: str = "",
+        force_penalty: bool = False,
+    ) -> bool:
+        """Return whether this failed source epoch carries a consequence."""
+
+        policy = self._hard_failure_policy()
+        with self._hard_failure_strike_lock:
+            self._hard_failure_strikes.configure(
+                failure_epochs_for_penalty=(
+                    policy.failure_epochs_for_penalty
+                ),
+                clean_hard_audit_epochs_for_reset=(
+                    policy.clean_hard_audit_epochs_for_reset
+                ),
+            )
+            penalty = self._hard_failure_strikes.record_failure(
+                key,
+                int(source_epoch),
+                endpoint=endpoint,
+                already_on_probation=(
+                    force_penalty
+                    or self._probation_tracker.is_on_probation(key)
+                ),
+            )
+            self._save_hard_failure_strikes_locked()
+        if not penalty:
+            bt.logging.info(
+                "Proof-v3 hard failure retained as neutral first strike for "
+                f"{key[0][:10]} model_index={key[1]} "
+                f"source_epoch={int(source_epoch)}; "
+                f"threshold={policy.failure_epochs_for_penalty} "
+                "(score/EMA/probation/proxy unchanged)"
+            )
+        return penalty
+
+    def _record_hard_failure_clean_pass(
+        self,
+        key: Tuple[str, int],
+        *,
+        source_epoch: int,
+    ) -> bool:
+        policy = self._hard_failure_policy()
+        with self._hard_failure_strike_lock:
+            self._hard_failure_strikes.configure(
+                failure_epochs_for_penalty=(
+                    policy.failure_epochs_for_penalty
+                ),
+                clean_hard_audit_epochs_for_reset=(
+                    policy.clean_hard_audit_epochs_for_reset
+                ),
+            )
+            cleared = self._hard_failure_strikes.record_clean_pass(
+                key,
+                int(source_epoch),
+            )
+            self._save_hard_failure_strikes_locked()
+        if cleared:
+            bt.logging.info(
+                "Proof-v3 pending hard-failure strike cleared for "
+                f"{key[0][:10]} model_index={key[1]} after "
+                f"{policy.clean_hard_audit_epochs_for_reset} clean hard "
+                "audit epoch(s)"
+            )
+        return cleared
+
+    def _hard_failure_penalty_required(
+        self,
+        key: Tuple[str, int],
+    ) -> bool:
+        with self._hard_failure_strike_lock:
+            return bool(
+                self._probation_tracker.is_on_probation(key)
+                or self._hard_failure_strikes.penalty_required(key)
+            )
+
+    def _clear_hard_failure_strike(
+        self,
+        key: Tuple[str, int],
+    ) -> None:
+        with self._hard_failure_strike_lock:
+            if self._hard_failure_strikes.clear(key):
+                self._save_hard_failure_strikes_locked()
+
     def _save_hard_audit_pass_epochs(self) -> None:
         value = {
             self._canary_debt_key(key): int(epoch)
@@ -5824,12 +5990,21 @@ class ValidatorNeuron:
         test: CanaryTest,
         *,
         completion_epoch: int,
+        source_epoch: int | None = None,
     ) -> None:
         if not bool(test.verify_proof):
             return
         key = self._miner_model_key(
             test.miner_address,
             test.model_index,
+        )
+        self._record_hard_failure_clean_pass(
+            key,
+            source_epoch=(
+                int(completion_epoch)
+                if source_epoch is None
+                else int(source_epoch)
+            ),
         )
         lock = getattr(self, "_hard_audit_pass_lock", None)
         if lock is None:
@@ -5929,8 +6104,10 @@ class ValidatorNeuron:
                 source_epoch
             )
             self._save_probation_recovery_source_epochs()
-            self._probation_tracker.record_pass(canonical_key)
+            lifted = self._probation_tracker.record_pass(canonical_key)
             self._db.record_pass(canonical_key[0], canonical_key[1])
+            if lifted:
+                self._clear_hard_failure_strike(canonical_key)
             return True
 
     @staticmethod
@@ -6004,14 +6181,23 @@ class ValidatorNeuron:
         model_index: int,
         obligation_id: bytes,
         failure_code: str,
+        endpoint: str = "",
     ) -> bool:
-        """Persist one owner-signed failure independently of the miner."""
+        """Persist the real failure and return whether policy applies penalty."""
 
         if not _proof_v3_hard_auditor_active(
             self.config,
             self._validator_hotkey_ss58,
         ):
-            return False
+            # A validator that cannot publish the designated owner's outcome
+            # must never manufacture a free neutral strike.
+            return True
+        key = self._miner_model_key(miner_address, model_index)
+        penalty_required = self._record_hard_failure_strike(
+            key,
+            source_epoch=int(source_epoch),
+            endpoint=endpoint,
+        )
         failure_key = (int(source_epoch), bytes(obligation_id))
         lock = getattr(self, "_hard_audit_failure_lock", None)
         if lock is None:
@@ -6027,11 +6213,12 @@ class ValidatorNeuron:
                 recorded = set()
                 self._hard_audit_failure_obligations = recorded
             if failure_key in recorded:
-                self._mark_probation_recovery_failure_epoch(
-                    self._miner_model_key(miner_address, model_index),
-                    source_epoch,
-                )
-                return True
+                if penalty_required:
+                    self._mark_probation_recovery_failure_epoch(
+                        key,
+                        source_epoch,
+                    )
+                return penalty_required
             try:
                 from neurons.proof_v3_hard_outcome import (
                     HardAuditFailureV3,
@@ -6056,11 +6243,12 @@ class ValidatorNeuron:
                     outcome.digest(),
                 )
                 recorded.add(failure_key)
-                self._mark_probation_recovery_failure_epoch(
-                    self._miner_model_key(miner_address, model_index),
-                    source_epoch,
-                )
-                return True
+                if penalty_required:
+                    self._mark_probation_recovery_failure_epoch(
+                        key,
+                        source_epoch,
+                    )
+                return penalty_required
             except Exception as exc:
                 # Signing/persistence belongs to the validator. Never turn it
                 # into miner evidence or let it suppress local enforcement.
@@ -6076,7 +6264,7 @@ class ValidatorNeuron:
                             model_index,
                         )
                     )
-                return False
+                return penalty_required
 
     def _hard_audit_due_entries(
         self,
@@ -6348,12 +6536,16 @@ class ValidatorNeuron:
             if not matches:
                 continue
             for miner in matches:
-                verdicts[
-                    self._miner_model_key(
-                        miner.address,
-                        miner.model_index,
-                    )
-                ] = False
+                key = self._miner_model_key(
+                    miner.address,
+                    miner.model_index,
+                )
+                if self._record_hard_failure_strike(
+                    key,
+                    source_epoch=outcome.source_epoch,
+                    endpoint=getattr(miner, "endpoint", ""),
+                ):
+                    verdicts[key] = False
             self._shared_hard_processed_failures.add(digest)
             newly_processed = True
         if newly_processed:
@@ -7517,8 +7709,9 @@ class ValidatorNeuron:
                         f"{test.miner_address[:10]} "
                         f"model_index={test.model_index}"
                     )
+                    penalty_required = True
                     if bool(test.verify_proof):
-                        self._record_hard_audit_failure(
+                        penalty_required = self._record_hard_audit_failure(
                             source_epoch=epoch_number,
                             miner_address=test.miner_address,
                             model_id=test.model_id,
@@ -7527,12 +7720,14 @@ class ValidatorNeuron:
                                 test.obligation_id
                             ),
                             failure_code="late_precommit_busy",
+                            endpoint=test.miner_endpoint,
                         )
-                    self._on_proof_failure(
-                        test.miner_address,
-                        test.model_index,
-                        endpoint=test.miner_endpoint,
-                    )
+                    if penalty_required:
+                        self._on_proof_failure(
+                            test.miner_address,
+                            test.model_index,
+                            endpoint=test.miner_endpoint,
+                        )
                 return
             kind = "full" if test.test_type == "full_context" else "low"
             test.rejection_intervals.append(
@@ -8180,12 +8375,13 @@ class ValidatorNeuron:
                         self._record_hard_audit_pass(
                             test,
                             completion_epoch=int(self._current_epoch),
+                            source_epoch=int(epoch_number),
                         )
                     elif test.verify_proof:
                         proof_failure_reason = (
                             "proof-v3 hard audit did not verify"
                         )
-                        self._record_hard_audit_failure(
+                        penalty_required = self._record_hard_audit_failure(
                             source_epoch=epoch_number,
                             miner_address=test.miner_address,
                             model_id=test.model_id,
@@ -8194,13 +8390,18 @@ class ValidatorNeuron:
                                 test.obligation_id
                             ),
                             failure_code="post_precommit_failure",
-                        )
-                        self._on_proof_failure(
-                            test.miner_address,
-                            test.model_index,
                             endpoint=test.miner_endpoint,
                         )
-                        if self._canary_epoch_active(epoch_number):
+                        if penalty_required:
+                            self._on_proof_failure(
+                                test.miner_address,
+                                test.model_index,
+                                endpoint=test.miner_endpoint,
+                            )
+                        if (
+                            penalty_required
+                            and self._canary_epoch_active(epoch_number)
+                        ):
                             self._canary_penalized_keys.add(
                                 self._miner_model_key(
                                     test.miner_address,
@@ -8625,21 +8826,27 @@ class ValidatorNeuron:
                         f"{test.miner_address[:10]} | model={test.model_id}"
                     )
                     return
+                penalty_required = True
                 if bool(test.verify_proof):
-                    self._record_hard_audit_failure(
+                    penalty_required = self._record_hard_audit_failure(
                         source_epoch=epoch_number,
                         miner_address=test.miner_address,
                         model_id=test.model_id,
                         model_index=test.model_index,
                         obligation_id=bytes.fromhex(test.obligation_id),
                         failure_code="post_precommit_failure",
+                        endpoint=test.miner_endpoint,
                     )
-                self._on_proof_failure(
-                    test.miner_address,
-                    test.model_index,
-                    endpoint=test.miner_endpoint,
-                )
-                if self._canary_epoch_active(epoch_number):
+                if penalty_required:
+                    self._on_proof_failure(
+                        test.miner_address,
+                        test.model_index,
+                        endpoint=test.miner_endpoint,
+                    )
+                if (
+                    penalty_required
+                    and self._canary_epoch_active(epoch_number)
+                ):
                     self._canary_penalized_keys.add(
                         self._miner_model_key(
                             test.miner_address,
@@ -8719,20 +8926,23 @@ class ValidatorNeuron:
             # deadline.  A peer-attributed timeout/error therefore fails
             # immediately instead of disappearing as validator-neutral work.
             if not self._canary_epoch_active(epoch_number):
+                penalty_required = True
                 if bool(test.verify_proof):
-                    self._record_hard_audit_failure(
+                    penalty_required = self._record_hard_audit_failure(
                         source_epoch=epoch_number,
                         miner_address=test.miner_address,
                         model_id=test.model_id,
                         model_index=test.model_index,
                         obligation_id=bytes.fromhex(test.obligation_id),
                         failure_code="post_precommit_failure",
+                        endpoint=test.miner_endpoint,
                     )
-                self._on_proof_failure(
-                    test.miner_address,
-                    test.model_index,
-                    endpoint=test.miner_endpoint,
-                )
+                if penalty_required:
+                    self._on_proof_failure(
+                        test.miner_address,
+                        test.model_index,
+                        endpoint=test.miner_endpoint,
+                    )
 
             # Log error to analytics DB
             try:
@@ -9248,6 +9458,13 @@ class ValidatorNeuron:
                 miner.address, miner.model_index,
                 new_endpoint=getattr(miner, 'endpoint', ''),
             )
+            with self._hard_failure_strike_lock:
+                if self._hard_failure_strikes.migrate_index(
+                    miner.address,
+                    miner.model_index,
+                    new_endpoint=getattr(miner, "endpoint", ""),
+                ):
+                    self._save_hard_failure_strikes_locked()
             # Also migrate in DB (old_index is found automatically inside)
             # DB migrate_probation needs explicit old index; use tracker's side-effect
             # to keep them in sync.
@@ -9332,6 +9549,10 @@ class ValidatorNeuron:
             expected_inventory = dict(
                 expected_obligations_by_key.get(key, {})
             )
+            hard_ids = self._epoch_close_value(
+                "_hard_canary_obligation_ids",
+                set(),
+            )
             completed_obligations = self._completed_canary_obligations(
                 own_receipts,
                 expected_inventory,
@@ -9346,6 +9567,16 @@ class ValidatorNeuron:
                 for obligation_id, (kind, _target) in expected_inventory.items()
                 if kind == "full" and obligation_id not in completed_obligations
             }
+            hard_missing = set(missing_full).intersection(hard_ids)
+            received_obligation_ids = {
+                bytes(
+                    getattr(receipt, "canary_obligation_id", b"") or b""
+                )
+                for receipt in own_receipts
+            }
+            absent_hard_obligations = hard_missing.difference(
+                received_obligation_ids
+            )
             suppress_probation = self._maintenance_grace_active(
                 current_epoch=epoch_number,
                 action="suppress_probation",
@@ -9383,25 +9614,35 @@ class ValidatorNeuron:
                     "precommit-busy interval"
                 )
 
-            obligation_failure = bool(
-                missing_low or (missing_full and not full_deferred)
-            )
-            if obligation_failure:
-                hard_ids = self._epoch_close_value(
-                    "_hard_canary_obligation_ids",
-                    set(),
-                )
-                for obligation_id in missing_full:
-                    if obligation_id not in hard_ids:
-                        continue
-                    self._record_hard_audit_failure(
-                        source_epoch=epoch_number,
-                        miner_address=miner.address,
-                        model_id=miner.model_id,
-                        model_index=miner.model_index,
-                        obligation_id=obligation_id,
-                        failure_code="obligation_missing",
+            hard_failure_penalty_required = False
+            if not full_deferred:
+                for obligation_id in absent_hard_obligations:
+                    hard_failure_penalty_required = (
+                        self._record_hard_audit_failure(
+                            source_epoch=epoch_number,
+                            miner_address=miner.address,
+                            model_id=miner.model_id,
+                            model_index=miner.model_index,
+                            obligation_id=obligation_id,
+                            failure_code="obligation_missing",
+                            endpoint=getattr(miner, "endpoint", ""),
+                        )
+                        or hard_failure_penalty_required
                     )
+            neutral_hard_obligation_ids: Set[bytes] = set()
+            if hard_missing and not hard_failure_penalty_required:
+                neutral_hard_obligation_ids.update(hard_missing)
+                for obligation_id in hard_missing:
+                    expected_inventory.pop(obligation_id, None)
+                expected = len(expected_inventory)
+
+            remaining_missing_full = set(missing_full).difference(
+                neutral_hard_obligation_ids
+            )
+            obligation_failure = bool(
+                missing_low
+                or (remaining_missing_full and not full_deferred)
+            )
             if obligation_failure and not suppress_probation:
                 if key not in canary_penalized_keys:
                     self._on_proof_failure(
@@ -9425,10 +9666,104 @@ class ValidatorNeuron:
             proof_failed = [
                 r for r in proof_tested if not r.proof_verified
             ]
+            hard_proof_failed = [
+                receipt
+                for receipt in proof_failed
+                if bytes(
+                    getattr(receipt, "canary_obligation_id", b"") or b""
+                )
+                in hard_ids
+            ]
+            nonhard_proof_failed = [
+                receipt
+                for receipt in proof_failed
+                if receipt not in hard_proof_failed
+            ]
             shared_hard_verdict = shared_hard_proof_verdicts.get(key)
             shared_hard_tests = 1 if shared_hard_verdict is not None else 0
             shared_hard_failures = (
                 1 if shared_hard_verdict is False else 0
+            )
+            if shared_hard_verdict is False:
+                hard_failure_penalty_required = (
+                    self._record_hard_failure_strike(
+                        key,
+                        source_epoch=epoch_number,
+                        endpoint=getattr(miner, "endpoint", ""),
+                        # A follower only receives a negative owner snapshot
+                        # once the owner's configured threshold was reached.
+                        force_penalty=self._proof_v3_follower_mode_active(),
+                    )
+                    or hard_failure_penalty_required
+                )
+            if hard_proof_failed:
+                # The live owner path normally recorded these immediately.
+                # Reconcile again at close so restart/replay is idempotent and
+                # cannot lose the strike decision.
+                for receipt in hard_proof_failed:
+                    hard_failure_penalty_required = (
+                        self._record_hard_audit_failure(
+                            source_epoch=epoch_number,
+                            miner_address=miner.address,
+                            model_id=miner.model_id,
+                            model_index=miner.model_index,
+                            obligation_id=bytes(
+                                getattr(
+                                    receipt,
+                                    "canary_obligation_id",
+                                    b"",
+                                )
+                                or b""
+                            ),
+                            failure_code="post_precommit_failure",
+                            endpoint=getattr(miner, "endpoint", ""),
+                        )
+                        or hard_failure_penalty_required
+                    )
+            if (
+                (hard_proof_failed or shared_hard_failures)
+                and not hard_failure_penalty_required
+            ):
+                neutral_hard_obligation_ids.update(
+                    bytes(
+                        getattr(receipt, "canary_obligation_id", b"")
+                        or b""
+                    )
+                    for receipt in hard_proof_failed
+                )
+                for obligation_id in neutral_hard_obligation_ids:
+                    expected_inventory.pop(obligation_id, None)
+                expected = len(expected_inventory)
+            if (
+                not hard_proof_failed
+                and shared_hard_verdict is not False
+                and (
+                    shared_hard_verdict is True
+                    or any(
+                        bytes(
+                            getattr(
+                                receipt,
+                                "canary_obligation_id",
+                                b"",
+                            )
+                            or b""
+                        )
+                        in hard_ids
+                        for receipt in proof_tested
+                    )
+                )
+            ):
+                self._record_hard_failure_clean_pass(
+                    key,
+                    source_epoch=epoch_number,
+                )
+
+            proof_failure_penalty_required = bool(
+                nonhard_proof_failed
+                or (
+                    (hard_proof_failed or shared_hard_failures)
+                    and hard_failure_penalty_required
+                )
             )
 
             # TEE attestation outcomes from own receipts
@@ -9447,6 +9782,12 @@ class ValidatorNeuron:
                 all_receipts=all_receipts,
                 proof_tests=len(proof_tested) + shared_hard_tests,
                 proof_failures=len(proof_failed) + shared_hard_failures,
+                proof_failure_penalty_required=(
+                    proof_failure_penalty_required
+                ),
+                neutral_hard_obligation_ids=(
+                    neutral_hard_obligation_ids
+                ),
                 tee_tests=len(tee_tested),
                 tee_failures=len(tee_failed),
                 tee_verified=len(tee_tested) > 0 and len(tee_failed) == 0,
@@ -9559,7 +9900,9 @@ class ValidatorNeuron:
             # ── Probation lifecycle (DB-backed + in-memory tracker) ──
             key = self._miner_model_key(miner.address, miner.model_index)
             had_proof_failure = (
-                outcome.proof_tests > 0 and outcome.proof_failures > 0
+                outcome.proof_tests > 0
+                and outcome.proof_failures > 0
+                and outcome.proof_failure_penalty_required
             )
             had_proof_failure = had_proof_failure or obligation_failure
             if had_proof_failure and not suppress_probation:
@@ -12182,15 +12525,24 @@ class ValidatorNeuron:
                     and receipt.proof_requested
                 )
             ]
-            if key in published_failures:
-                hard_verdict = 0
-            elif own_hard_receipts:
-                hard_verdict = int(
-                    all(
-                        receipt.proof_verified is True
-                        for receipt in own_hard_receipts
-                    )
+            raw_hard_failure = bool(
+                key in published_failures
+                or any(
+                    receipt.proof_verified is not True
+                    for receipt in own_hard_receipts
                 )
+            )
+            if raw_hard_failure:
+                # The raw failure remains owner-signed and retained.  A first
+                # strike is operationally neutral, so followers receive no
+                # negative scoring verdict until the configured threshold.
+                hard_verdict = (
+                    0
+                    if self._hard_failure_penalty_required(key)
+                    else -1
+                )
+            elif own_hard_receipts:
+                hard_verdict = 1
             else:
                 hard_verdict = -1
 
