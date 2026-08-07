@@ -12057,6 +12057,7 @@ class ValidatorNeuron:
             ) from exc
 
         entries: list[VerdictSnapshotEntryV1] = []
+        omitted_identity_count = 0
         for miner in self._epoch_close_value("_epoch_miners", ()):
             key = self._miner_model_key(
                 miner.address,
@@ -12088,6 +12089,29 @@ class ValidatorNeuron:
                 hard_verdict = -1
 
             uid = self._resolve_uid(miner.address)
+            miner_hotkey_ss58 = str(
+                getattr(miner, "hotkey_ss58", "") or ""
+            )
+            if not miner_hotkey_ss58:
+                hotkey_lookup = getattr(self, "_get_miner_ss58", None)
+                if callable(hotkey_lookup):
+                    miner_hotkey_ss58 = str(
+                        hotkey_lookup(miner.address, "hotkey") or ""
+                    )
+            if not miner_hotkey_ss58 and uid is not None:
+                owner_lookup = getattr(self._db, "get_uid_owner", None)
+                if callable(owner_lookup):
+                    owner = owner_lookup(int(uid)) or {}
+                    if (
+                        str(owner.get("evm_address") or "").lower()
+                        == str(miner.address).lower()
+                    ):
+                        miner_hotkey_ss58 = str(
+                            owner.get("hotkey_ss58") or ""
+                        )
+            if not miner_hotkey_ss58:
+                omitted_identity_count += 1
+                continue
             capacity_gated = bool(
                 self._capacity_audit_score_gate_reason(
                     miner.address,
@@ -12104,9 +12128,7 @@ class ValidatorNeuron:
                 VerdictSnapshotEntryV1(
                     miner_address=str(miner.address).lower(),
                     model_index=int(miner.model_index),
-                    miner_hotkey_ss58=str(
-                        getattr(miner, "hotkey_ss58", "") or ""
-                    ),
+                    miner_hotkey_ss58=miner_hotkey_ss58,
                     model_id=str(miner.model_id),
                     hard_verdict=hard_verdict,
                     hard_source_epoch=(
@@ -12115,6 +12137,12 @@ class ValidatorNeuron:
                     capacity_gated=capacity_gated,
                     probation=self._probation_tracker.is_on_probation(key),
                 )
+            )
+        if omitted_identity_count:
+            bt.logging.warning(
+                "VerdictSnapshotV1 omitted "
+                f"{omitted_identity_count} endpoint(s) whose validator-owned "
+                "SS58 identity could not be authenticated"
             )
         snapshot = sign_verdict_snapshot_v1(
             VerdictSnapshotV1(
