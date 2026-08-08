@@ -961,6 +961,10 @@ class ValidatorNeuron:
         self._proof_v3_canary_policy = None
         self._proof_v3_local_release_model_ids: Set[str] = set()
         self._proof_v3_remote_refresh_after: float = 0.0
+        # Digest of the last remote index whose complete releases and signed
+        # policy were authenticated. The hourly refresh first compares this
+        # bounded index so unchanged catalogs do not stall epoch setup.
+        self._proof_v3_remote_index_sha256: bytes = b""
         # Remote miner_version tracking — opens a forgiveness window after a
         # release lands in the public repo, so miners restarting to pull the
         # new code don't get probation for "canary errors" that are really
@@ -1015,6 +1019,8 @@ class ValidatorNeuron:
         self._epoch_close_retry_after: float = 0.0  # monotonic time
         self._epoch_close_backoff: float = 30.0  # seconds, doubles on failure
         self._weight_update_due: bool = False
+        self._weight_update_lock = threading.Lock()
+        self._weight_updates_pending: int = 0
         self._last_known_block: int = 0  # fallback for _get_current_block
         # The stream watchdog can replace a subscription while its callback is
         # still completing a slow epoch close.  Serialize block delivery across
@@ -1063,6 +1069,25 @@ class ValidatorNeuron:
         self._control_executor = ThreadPoolExecutor(
             max_workers=config.max_concurrent_verifications,
         )
+        # Weight transactions are ordered state transitions. Async epoch
+        # closes may overlap, but their submissions must never race or land
+        # out of epoch order.
+        self._weight_update_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="weight-update",
+        )
+        # Slow/retrying reportOffline transactions are a best-effort chain
+        # side effect. They must never consume the workers used for epoch
+        # discovery, identity checks, or weight setting. Do not queue stale
+        # reports behind a degraded RPC: a delayed vote could land after an
+        # honest endpoint has already recovered.
+        self._report_offline_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="report-offline",
+        )
+        self._report_offline_lock = threading.Lock()
+        self._report_offline_inflight: Set[Tuple[str, int]] = set()
+        self._report_offline_slots = threading.BoundedSemaphore(2)
         # Capacity-audit scheduling must not queue behind epoch identity checks:
         # short drain windows are intentionally only a few blocks long. Keep
         # scheduling serialized so adjacent hash-triggered windows observe each
@@ -1517,6 +1542,10 @@ class ValidatorNeuron:
                 "Loaded remote proof-v3 artifact index from "
                 f"{remote.index_source_url}"
             )
+            if not remote.failures:
+                self._proof_v3_remote_index_sha256 = bytes(
+                    getattr(remote, "index_sha256", b"") or b""
+                )
             indexed_policy_path = str(
                 getattr(remote, "canary_policy_path", "") or ""
             ).strip()
@@ -1605,10 +1634,30 @@ class ValidatorNeuron:
             return
 
         from verallm.proof_v3.artifact_store import (
+            probe_remote_proof_v3_index,
             resolve_remote_proof_v3_releases,
         )
 
         try:
+            probe = probe_remote_proof_v3_index(
+                remote_base_urls,
+                chain_config=self.config,
+                cache_directory=getattr(
+                    self.config,
+                    "proof_v3_artifact_cache_dir",
+                    None,
+                ),
+                timeout_seconds=5.0,
+            )
+            previous_index = bytes(
+                getattr(self, "_proof_v3_remote_index_sha256", b"") or b""
+            )
+            if previous_index and probe.index_sha256 == previous_index:
+                bt.logging.debug(
+                    "Proof-v3 remote index is unchanged; retaining the "
+                    "authenticated in-memory release snapshot"
+                )
+                return
             remote = resolve_remote_proof_v3_releases(
                 remote_base_urls,
                 chain_config=self.config,
@@ -1682,6 +1731,10 @@ class ValidatorNeuron:
         # an old policy with a new release (or the inverse).
         self._proof_v3_releases = updated
         self._proof_v3_canary_policy = policy
+        if not remote.failures:
+            self._proof_v3_remote_index_sha256 = bytes(
+                getattr(remote, "index_sha256", b"") or b""
+            )
         if changed:
             bt.logging.info(
                 f"Refreshed {changed} proof-v3 release(s) and signed policy "
@@ -4978,9 +5031,6 @@ class ValidatorNeuron:
                             )
                         if bool(state.weight_update_due):
                             self._schedule_weight_update()
-                        auto_updater = getattr(self, "_auto_updater", None)
-                        if auto_updater is not None:
-                            auto_updater.notify_not_busy()
                         return
                     finally:
                         local.state = None
@@ -4993,6 +5043,9 @@ class ValidatorNeuron:
         finally:
             local.state = None
             self._epoch_close_futures.pop(epoch_number, None)
+            auto_updater = getattr(self, "_auto_updater", None)
+            if auto_updater is not None:
+                auto_updater.notify_not_busy()
 
     def _queue_epoch_close(self, epoch_number: int) -> bool:
         """Queue one immutable close and return without waiting for it."""
@@ -5225,29 +5278,86 @@ class ValidatorNeuron:
                 )
 
         def _set_weights_with_retry(_weights=dict(weights)):
-            for attempt in range(1, 4):
-                try:
-                    self._set_weights(_weights)
-                    self._last_weights = _weights
-                    return
-                except Exception as exc:
-                    if attempt == 3:
-                        bt.logging.error(
-                            f"set_weights failed after 3 attempts: {exc}"
-                        )
-                    else:
-                        delay = 30 * (2 ** (attempt - 1))
-                        bt.logging.warning(
-                            f"set_weights attempt {attempt}/3 failed: {exc} "
-                            f"— retrying in {delay}s"
-                        )
-                        time.sleep(delay)
+            try:
+                for attempt in range(1, 4):
+                    try:
+                        self._set_weights(_weights)
+                        self._last_weights = _weights
+                        return
+                    except Exception as exc:
+                        if attempt == 3:
+                            bt.logging.error(
+                                f"set_weights failed after 3 attempts: {exc}"
+                            )
+                        else:
+                            delay = 30 * (2 ** (attempt - 1))
+                            bt.logging.warning(
+                                f"set_weights attempt {attempt}/3 failed: {exc} "
+                                f"— retrying in {delay}s"
+                            )
+                            time.sleep(delay)
+            finally:
+                with self._weight_update_lock:
+                    self._weight_updates_pending = max(
+                        0,
+                        int(self._weight_updates_pending) - 1,
+                    )
+                auto_updater = getattr(self, "_auto_updater", None)
+                if auto_updater is not None:
+                    auto_updater.notify_not_busy()
 
-        self._control_executor.submit(_set_weights_with_retry)
+        with self._weight_update_lock:
+            self._weight_updates_pending += 1
+        try:
+            self._weight_update_executor.submit(_set_weights_with_retry)
+        except Exception:
+            with self._weight_update_lock:
+                self._weight_updates_pending = max(
+                    0,
+                    int(self._weight_updates_pending) - 1,
+                )
+            raise
 
     # ------------------------------------------------------------------
     # Epoch lifecycle
     # ------------------------------------------------------------------
+
+    def _auto_update_busy(self) -> bool:
+        """Return whether restarting could destroy live validator work."""
+
+        if bool(getattr(self, "_epoch_setup_in_progress", False)):
+            return True
+        weight_lock = getattr(self, "_weight_update_lock", None)
+        if weight_lock is None:
+            if bool(getattr(self, "_weight_updates_pending", 0)):
+                return True
+        else:
+            with weight_lock:
+                if int(getattr(self, "_weight_updates_pending", 0)) > 0:
+                    return True
+        try:
+            close_futures = tuple(
+                getattr(self, "_epoch_close_futures", {}).values()
+            )
+        except RuntimeError:
+            return True
+        for future in close_futures:
+            if future is None:
+                return True
+            done = getattr(future, "done", None)
+            if not callable(done) or not done():
+                return True
+        try:
+            inflight = tuple(
+                getattr(self, "_inflight_canaries", {}).values()
+            ) + tuple(
+                getattr(self, "_closing_inflight_canaries", {}).values()
+            )
+            if any(bool(entries) for entries in inflight):
+                return True
+        except RuntimeError:
+            return True
+        return False
 
     def _start_new_epoch(self, epoch_start_block: int):
         """Start a new epoch — non-blocking; heavy setup runs on executor."""
@@ -5293,6 +5403,9 @@ class ValidatorNeuron:
                 bt.logging.error(f"Epoch {epoch_number} setup failed: {e}")
             finally:
                 self._epoch_setup_in_progress = False
+                auto_updater = getattr(self, "_auto_updater", None)
+                if auto_updater is not None:
+                    auto_updater.notify_not_busy()
 
         self._control_executor.submit(_setup_and_clear_flag)
 
@@ -7199,7 +7312,7 @@ class ValidatorNeuron:
                         # Dispatch chain call to executor — wait_for_transaction_receipt
                         # blocks up to 360s per call (3×120s retries) and would stall the
                         # main loop while we wait.  Background task logs its own outcome.
-                        self._control_executor.submit(self._report_offline, miner)
+                        self._submit_report_offline(miner)
                         continue
                     if result is None and self.config.identity_challenge_required:
                         bt.logging.info(
@@ -7274,7 +7387,7 @@ class ValidatorNeuron:
                     gpu_uuids=getattr(miner, "gpu_uuids", []),
                 )
                 self._db.save_score(miner.address, miner.model_index, 0.0, 0, 0)
-                self._control_executor.submit(self._report_offline, miner)
+                self._submit_report_offline(miner)
             self._epoch_miners = [m for m in self._epoch_miners if id(m) not in failed_ids]
             bt.logging.info(
                 f"Hardware health: {len(self._epoch_miners)}/{len(self._epoch_miners) + len(hardware_failed)} "
@@ -7371,8 +7484,15 @@ class ValidatorNeuron:
                 else:
                     bt.logging.warning(f"Failed to fetch ModelSpec for {model_id}: {e} — no cache available")
 
+        artifact_refresh_started = time.monotonic()
         self._refresh_remote_proof_v2_manifests(unique_models)
         self._refresh_remote_proof_v3_releases(unique_models)
+        artifact_refresh_elapsed = time.monotonic() - artifact_refresh_started
+        if artifact_refresh_elapsed > 12.0:
+            bt.logging.warning(
+                "Epoch setup artifact refresh exceeded one block: "
+                f"{artifact_refresh_elapsed:.1f}s"
+            )
 
         # Reset per-epoch attempt state. Exact obligations are registered after
         # the scheduler has produced the signed-policy plan.
@@ -7393,10 +7513,17 @@ class ValidatorNeuron:
         # Check if TEE is enabled on the subnet (feature flag from SubnetConfig)
         _subnet_tee_enabled = False
         if self._subnet_config_client is not None:
+            tee_refresh_started = time.monotonic()
             try:
                 _subnet_tee_enabled = self._subnet_config_client.is_tee_enabled_on_subnet()
             except Exception:
                 pass
+            tee_refresh_elapsed = time.monotonic() - tee_refresh_started
+            if tee_refresh_elapsed > 12.0:
+                bt.logging.warning(
+                    "Epoch setup TEE feature lookup exceeded one block: "
+                    f"{tee_refresh_elapsed:.1f}s"
+                )
         if not _subnet_tee_enabled:
             # TEE disabled on subnet — treat all miners as non-TEE (use ZK proofs)
             for miner in self._epoch_miners:
@@ -10030,7 +10157,7 @@ class ValidatorNeuron:
             if self._db.should_escalate(miner.address, miner.model_index, epoch_number):
                 bt.logging.info(f"Probation ESCALATION for {miner.address[:10]} model_index={miner.model_index} -> reportOffline")
                 # Background dispatch — chain wait must not block epoch close
-                self._control_executor.submit(self._report_offline, miner)
+                self._submit_report_offline(miner)
 
         # ── Zero undiscovered miners ───────────────────────────────
         # If a miner's lease expired or it wasn't discovered this epoch,
@@ -11756,9 +11883,29 @@ class ValidatorNeuron:
         self.scorer.halve_ema(miner_address, model_index)
         self._db.halve_ema(miner_address, model_index)
 
-        # Immediately update shared state so proxy cuts off this miner
-        self._write_shared_state()
-        bt.logging.info(f"Mid-epoch cutoff: {miner_address[:10]} model_index={model_index} on probation, shared state updated for proxy")
+        # A genuine mid-epoch failure must reach the proxy immediately. During
+        # epoch close, however, every entry is processed in one frozen batch
+        # and _close_epoch writes the complete state once at the end. Rewriting
+        # the full snapshot per failed entry can otherwise stall the next
+        # epoch's setup for tens of seconds on a large network.
+        close_local = getattr(self, "_epoch_close_local", None)
+        closing_batch = bool(
+            close_local is not None
+            and getattr(close_local, "state", None) is not None
+        )
+        if not closing_batch:
+            self._write_shared_state()
+            bt.logging.info(
+                f"Mid-epoch cutoff: {miner_address[:10]} "
+                f"model_index={model_index} on probation, shared state "
+                "updated for proxy"
+            )
+        else:
+            bt.logging.debug(
+                f"Close-time cutoff batched for {miner_address[:10]} "
+                f"model_index={model_index}; final shared-state publication "
+                "will include it"
+            )
 
     # ------------------------------------------------------------------
     # Identity verification (anti-hijacking)
@@ -12462,6 +12609,50 @@ class ValidatorNeuron:
         except Exception as e:
             bt.logging.debug(f"Metagraph enrichment failed: {e}")
 
+    def _submit_report_offline(self, miner: ActiveMiner) -> bool:
+        """Queue one bounded, deduplicated reportOffline side effect."""
+
+        executor = getattr(self, "_report_offline_executor", None)
+        lock = getattr(self, "_report_offline_lock", None)
+        slots = getattr(self, "_report_offline_slots", None)
+        inflight = getattr(self, "_report_offline_inflight", None)
+        # Narrow unit fixtures created with __new__ retain the old synchronous
+        # executor seam. Normal validator instances always use the isolated
+        # bounded pool initialized in __init__.
+        if executor is None or lock is None or slots is None or inflight is None:
+            self._control_executor.submit(self._report_offline, miner)
+            return True
+
+        key = (str(miner.address).lower(), int(miner.model_index))
+        with lock:
+            if key in inflight:
+                return False
+            if not slots.acquire(blocking=False):
+                bt.logging.warning(
+                    "reportOffline queue is saturated; skipping best-effort "
+                    f"chain report for {miner.address[:10]} "
+                    f"model_index={miner.model_index}"
+                )
+                return False
+            inflight.add(key)
+
+        def _run() -> None:
+            try:
+                self._report_offline(miner)
+            finally:
+                with lock:
+                    inflight.discard(key)
+                slots.release()
+
+        try:
+            executor.submit(_run)
+        except Exception:
+            with lock:
+                inflight.discard(key)
+            slots.release()
+            raise
+        return True
+
     def _report_offline(self, miner: ActiveMiner):
         """Report a miner-model entry as offline."""
         if self._evm_disabled:
@@ -13026,20 +13217,45 @@ class ValidatorNeuron:
 
     def _get_current_block(self) -> int:
         """Get the current best/head block number."""
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TE
         try:
-            with ThreadPoolExecutor(1) as pool:
-                future = pool.submit(self._get_current_head_block_and_hash)
-                block, _hash, real = future.result(timeout=15)
-                if real and block > 0:
-                    return block
-                return self._last_known_block
-        except _TE:
+            block, _hash, real = self._get_current_head_with_timeout(15.0)
+            if real and block > 0:
+                return block
+            return self._last_known_block
+        except _FuturesTimeout:
             bt.logging.warning("get_current_block timed out (15s) — reconnecting")
-            self.__subtensor = None  # force reconnect on next call
             return self._last_known_block
         except Exception:
             return self._last_known_block
+
+    def _get_current_head_with_timeout(
+        self,
+        timeout_seconds: float,
+    ) -> tuple[int, bytes | None, bool]:
+        """Bound a potentially stuck SDK head lookup without waiting on exit.
+
+        ``ThreadPoolExecutor`` waits for its worker when used as a context
+        manager, even after ``Future.result(timeout=...)`` raises. Keep the
+        shutdown explicitly non-blocking and close the stale RPC connection
+        so a timed-out worker can unwind in the background.
+        """
+
+        pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="validator-head-lookup",
+        )
+        future = pool.submit(self._get_current_head_block_and_hash)
+        try:
+            return future.result(timeout=max(0.001, float(timeout_seconds)))
+        except _FuturesTimeout:
+            future.cancel()
+            stale = getattr(self, "_ValidatorNeuron__subtensor", None)
+            self.__subtensor = None
+            if stale is not None:
+                self._close_subtensor(stale)
+            raise
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     _cached_metagraph_line: str = ""
 
@@ -13078,23 +13294,18 @@ class ValidatorNeuron:
     def _get_current_block_with_retry(self, max_attempts: int = 30) -> int:
         """Get current best/head block with retry — used at startup only."""
         import random
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TE
         for attempt in range(1, max_attempts + 1):
             try:
                 bt.logging.debug(f"get_current_head_block attempt {attempt}/{max_attempts}...")
-                with ThreadPoolExecutor(1) as pool:
-                    future = pool.submit(self._get_current_head_block_and_hash)
-                    block, _hash, real = future.result(timeout=30)
+                block, _hash, real = self._get_current_head_with_timeout(30.0)
                 if real and block > 0:
                     bt.logging.debug(f"get_current_head_block: block={block}")
                     return block
-            except _TE:
+            except _FuturesTimeout:
                 bt.logging.warning(
                     f"get_current_head_block timed out after 30s (attempt {attempt}/{max_attempts}) — "
                     f"Subtensor WS may be hanging",
                 )
-                # Force reconnect on next attempt by clearing cached subtensor
-                self.__subtensor = None
             except Exception as e:
                 if attempt == max_attempts:
                     raise RuntimeError(
@@ -13564,6 +13775,8 @@ class ValidatorNeuron:
             self._capacity_audit_server.should_exit = True
         self._executor.shutdown(wait=False)
         self._control_executor.shutdown(wait=False)
+        self._weight_update_executor.shutdown(wait=False)
+        self._report_offline_executor.shutdown(wait=False)
         self._epoch_close_executor.shutdown(wait=False)
         self._capacity_audit_executor.shutdown(wait=False)
         self._capacity_audit_discovery_executor.shutdown(wait=False)
@@ -13974,8 +14187,8 @@ def main():
         from neurons.auto_update import AutoUpdater
 
         def _validator_busy() -> bool:
-            """Don't restart during epoch close or weight setting."""
-            return neuron._pending_epoch_close is not None
+            """Don't restart while validator-owned work is live."""
+            return neuron._auto_update_busy()
 
         neuron._auto_updater = AutoUpdater(
             role="validator",
