@@ -753,6 +753,12 @@ class AutoUpdater:
         """
         if not self._update_pending:
             return
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Deferred update notification arrived while process is still "
+                "busy — retaining it for the next idle window"
+            )
+            return
         bt.logging.info("Deferred update ready — applying now")
         self._update_pending = False
         if not pull_and_install(
@@ -762,8 +768,22 @@ class AutoUpdater:
             bt.logging.error("Deferred update failed — will retry next cycle")
             return
         bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
-        time.sleep(self.restart_delay)
+        self._wait(self.restart_delay)
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Process became busy during deferred-update restart delay — "
+                "retaining update for the next idle window"
+            )
+            self._update_pending = True
+            return
         self._stagger_sleep()
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Process became busy during update stagger — retaining update "
+                "for the next idle window"
+            )
+            self._update_pending = True
+            return
         restart_process()
 
     def _stagger_sleep(self) -> None:
@@ -817,4 +837,10 @@ class AutoUpdater:
             return
 
         self._stagger_sleep()
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Process became busy during update stagger — deferring restart"
+            )
+            self._update_pending = True
+            return
         restart_process()

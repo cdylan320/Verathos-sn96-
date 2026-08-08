@@ -77,7 +77,6 @@ PROOF_V3_RELEASE_ENV = "VERATHOS_PROOF_V3_RELEASE"
 
 PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS = 60.0
 PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS = 5.0
-PROOF_V3_ARTIFACT_REFRESH_MAX_ACTIVE_DEFERRAL_SECONDS = 300.0
 
 
 def _configured_miner_proof_protocol_versions(
@@ -107,9 +106,9 @@ class ProofV3ArtifactRefreshWatcher:
 
     A cheap chain-context-checked index probe runs on the steady-state path.
     A candidate change is fully downloaded and authenticated before a restart
-    is scheduled.  Hard proofs and capacity audits are never interrupted;
-    ordinary requests receive a bounded idle-window opportunity so sustained
-    traffic cannot suppress a required security-profile adoption forever.
+    is scheduled. Live inference, hard proofs, and capacity audits are never
+    interrupted; the authenticated update remains pending until the endpoint
+    reaches an idle adoption window.
     """
 
     def __init__(
@@ -122,9 +121,6 @@ class ProofV3ArtifactRefreshWatcher:
         restart: Callable[[], None],
         interval_seconds: float = PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS,
         retry_seconds: float = PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS,
-        max_active_deferral_seconds: float = (
-            PROOF_V3_ARTIFACT_REFRESH_MAX_ACTIVE_DEFERRAL_SECONDS
-        ),
     ) -> None:
         if (
             type(current_release_sha256) is not bytes
@@ -136,7 +132,7 @@ class ProofV3ArtifactRefreshWatcher:
             for value in (probe_release, resolve_release, busy_state, restart)
         ):
             raise ValueError("proof-v3 artifact refresh callbacks are invalid")
-        if min(interval_seconds, retry_seconds, max_active_deferral_seconds) <= 0:
+        if min(interval_seconds, retry_seconds) <= 0:
             raise ValueError("proof-v3 artifact refresh timing is invalid")
         self.current_release_sha256 = current_release_sha256
         self.probe_release = probe_release
@@ -145,7 +141,6 @@ class ProofV3ArtifactRefreshWatcher:
         self.restart = restart
         self.interval_seconds = float(interval_seconds)
         self.retry_seconds = float(retry_seconds)
-        self.max_active_deferral_seconds = float(max_active_deferral_seconds)
         self._pending_release_sha256: bytes | None = None
         self._pending_since: float | None = None
         self._restart_triggered = False
@@ -191,28 +186,16 @@ class ProofV3ArtifactRefreshWatcher:
         )
         if proof_pending > 0 or hard_exclusive or capacity_active:
             return "deferred_proof_or_audit"
-        pending_since = self._pending_since
-        if (
-            active_requests > 0
-            and pending_since is not None
-            and selected_now - pending_since
-            < self.max_active_deferral_seconds
-        ):
+        if active_requests > 0:
             return "deferred_active_requests"
         if self._stop_event.is_set():
             return "stopped"
 
         self._restart_triggered = True
-        if active_requests > 0:
-            bt.logging.warning(
-                "Proof-v3 artifact adoption reached its bounded ordinary-request "
-                "deferral; restarting onto the authenticated release"
-            )
-        else:
-            bt.logging.info(
-                "Proof-v3 artifact adoption window is idle; restarting onto "
-                "the authenticated release"
-            )
+        bt.logging.info(
+            "Proof-v3 artifact adoption window is idle; restarting onto "
+            "the authenticated release"
+        )
         try:
             self.restart()
         except BaseException:
@@ -1066,9 +1049,23 @@ class MinerNeuron:
                 capacity_active,
             )
         except Exception:
-            # A live but unreadable server gets the ordinary bounded deferral;
-            # it cannot suppress adoption indefinitely by hiding health.
+            # A live but unreadable server is treated as busy. Validators
+            # independently enforce the authenticated release, so update
+            # adoption never needs to destroy an honest in-flight request.
             return 1, 0, False, capacity_active
+
+    def _auto_update_busy(self, endpoint: str) -> bool:
+        """Never restart through live inference, proof, or capacity work."""
+
+        active, proof_pending, hard_exclusive, capacity_active = (
+            self._proof_v3_refresh_busy_state(endpoint)
+        )
+        return bool(
+            active > 0
+            or proof_pending > 0
+            or hard_exclusive
+            or capacity_active
+        )
 
     def start_proof_v3_artifact_refresh(
         self,
@@ -2627,9 +2624,13 @@ def main():
     if args.auto_update:
         from neurons.auto_update import AutoUpdater
 
+        def _miner_busy() -> bool:
+            return neuron._auto_update_busy(local_health_url)
+
         updater = AutoUpdater(
             role="miner",
             check_interval=args.auto_update_interval,
+            busy_check=_miner_busy,
             jitter_seconds=args.auto_update_jitter,
             jitter_seed=neuron.hotkey_seed,
         )
