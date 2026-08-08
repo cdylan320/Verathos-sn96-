@@ -78,6 +78,10 @@ class NeuronConfig(ChainConfig):
     # local fallback when that config is unavailable.
     proof_v3_failure_epochs_for_penalty: int = 1
     proof_v3_failure_clean_epochs_for_reset: int = 3
+    # Monotonic, owner-controlled generation used for a one-time network-wide
+    # operational probation reset.  It is intentionally not exposed as an
+    # environment knob; only the owner-hosted subnet config may advance it.
+    proof_v3_probation_state_generation: int = 0
 
     # Demand bonus
     demand_bonus_enabled: bool = True  # enable per-model demand bonus

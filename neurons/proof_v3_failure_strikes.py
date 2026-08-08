@@ -134,6 +134,13 @@ class HardProofStrikeTracker:
     def clear(self, key: Tuple[str, int]) -> bool:
         return self._states.pop(self._key(key), None) is not None
 
+    def clear_all(self) -> int:
+        """Clear all pending and penalty-bearing hard-proof strike state."""
+
+        count = len(self._states)
+        self._states.clear()
+        return count
+
     def migrate_index(
         self,
         address: str,

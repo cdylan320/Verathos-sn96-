@@ -78,6 +78,7 @@ class ProofV3FailurePolicyConfig:
 
     failure_epochs_for_penalty: int = 1
     clean_hard_audit_epochs_for_reset: int = 3
+    probation_state_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -352,12 +353,23 @@ def _parse_proof_v3_failure_policy(
         {
             "failure_epochs_for_penalty",
             "clean_hard_audit_epochs_for_reset",
+            "probation_state_generation",
         }
     )
     if unknown:
         raise SubnetRuntimeConfigError(
             "proof_v3_failure_policy contains unsupported fields: "
             + ", ".join(sorted(unknown))
+        )
+    generation = raw.get("probation_state_generation", 0)
+    _reject_bool(generation, "probation_state_generation")
+    if not isinstance(generation, int):
+        raise SubnetRuntimeConfigError(
+            "probation_state_generation must be an integer"
+        )
+    if not 0 <= generation <= 2**31 - 1:
+        raise SubnetRuntimeConfigError(
+            "probation_state_generation must be in [0, 2147483647]"
         )
     return ProofV3FailurePolicyConfig(
         failure_epochs_for_penalty=_require_int(
@@ -372,6 +384,7 @@ def _parse_proof_v3_failure_policy(
             minimum=1,
             maximum=100,
         ),
+        probation_state_generation=int(generation),
     )
 
 
@@ -1040,6 +1053,9 @@ def apply_runtime_config_to_neuron_config(
     config.proof_v3_failure_clean_epochs_for_reset = (
         failure_policy.clean_hard_audit_epochs_for_reset
     )
+    config.proof_v3_probation_state_generation = (
+        failure_policy.probation_state_generation
+    )
     grace = runtime.maintenance_grace
     config.maintenance_grace_enabled = grace.enabled
     config.maintenance_grace_open_ended = grace.open_ended
@@ -1127,6 +1143,9 @@ def proof_v3_failure_policy_config_from_neuron_config(
         ),
         clean_hard_audit_epochs_for_reset=int(
             getattr(config, "proof_v3_failure_clean_epochs_for_reset", 3)
+        ),
+        probation_state_generation=int(
+            getattr(config, "proof_v3_probation_state_generation", 0)
         ),
     )
 

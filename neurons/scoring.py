@@ -1191,6 +1191,14 @@ class ProbationTracker:
             self._save()
         return len(stale_keys)
 
+    def clear_all(self) -> int:
+        """Clear all operational probation entries and persist once."""
+
+        count = len(self._probation)
+        self._probation.clear()
+        self._save()
+        return count
+
     def _save(self) -> None:
         """Persist probation state to disk (atomic write)."""
         data = []

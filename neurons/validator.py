@@ -784,6 +784,12 @@ class ValidatorNeuron:
             ),
         )
         self._load_hard_failure_strikes()
+        self._probation_state_reset_effective_epoch: int | None = None
+        raw_reset_epoch = self._db.get_meta(
+            "proof_v3_probation_state_reset_effective_epoch_v1"
+        )
+        if raw_reset_epoch:
+            self._probation_state_reset_effective_epoch = int(raw_reset_epoch)
 
         self.evm_pk = ""
         self.evm_addr = ""
@@ -1107,6 +1113,14 @@ class ValidatorNeuron:
         self._proof_protocol_rollout_cfg = runtime.proof_protocol_rollout
         self._proof_v3_failure_policy_cfg = runtime.proof_v3_failure_policy
         self._maintenance_grace_cfg = runtime.maintenance_grace
+        self._apply_probation_state_generation(
+            runtime.proof_v3_failure_policy,
+            effective_epoch=(
+                runtime.effective_epoch
+                if runtime.effective_epoch is not None
+                else current_epoch
+            ),
+        )
         with self._hard_failure_strike_lock:
             self._hard_failure_strikes.configure(
                 failure_epochs_for_penalty=(
@@ -4436,6 +4450,14 @@ class ValidatorNeuron:
         model_index: int,
         uid: int,
     ) -> None:
+        close_epoch = int(
+            self._epoch_close_value(
+                "_current_epoch",
+                getattr(self, "_current_epoch", 0),
+            )
+        )
+        if self._probation_reset_covers_source_epoch(close_epoch):
+            return
         tracker = getattr(self, "_probation_tracker", None)
         if tracker is None or self._maintenance_grace_active(action="suppress_probation"):
             return
@@ -4450,9 +4472,6 @@ class ValidatorNeuron:
             ):
                 endpoint = str(getattr(miner, "endpoint", "") or "")
                 break
-        close_epoch = int(
-            self._epoch_close_value("_current_epoch", self._current_epoch)
-        )
         tracker.enter_probation(key, close_epoch, endpoint=endpoint)
         self._db.enter_probation(address, model_index, close_epoch, uid=int(uid))
         self._write_shared_state()
@@ -5853,6 +5872,74 @@ class ValidatorNeuron:
             self.config
         )
 
+    def _probation_reset_covers_source_epoch(self, source_epoch: int) -> bool:
+        reset_epoch = getattr(
+            self,
+            "_probation_state_reset_effective_epoch",
+            None,
+        )
+        return reset_epoch is not None and int(source_epoch) < int(reset_epoch)
+
+    def _apply_probation_state_generation(
+        self,
+        policy: ProofV3FailurePolicyConfig,
+        *,
+        effective_epoch: int | None,
+    ) -> bool:
+        """Apply an owner-hosted probation reset once per generation."""
+
+        target = int(policy.probation_state_generation)
+        raw_current = self._db.get_meta(
+            "proof_v3_probation_state_generation_v1"
+        )
+        current = int(raw_current or 0)
+        if target < current:
+            bt.logging.warning(
+                "Ignoring probation state generation rollback "
+                f"{current}->{target}"
+            )
+            return False
+        if target == current:
+            return False
+        reset_epoch = int(
+            effective_epoch
+            if effective_epoch is not None
+            else getattr(self, "_current_epoch", 0)
+        )
+
+        # The sidecar file is cleared before the DB transaction.  If the
+        # process stops between them, the persisted generation remains old and
+        # the operation safely retries on restart.  The DB transaction then
+        # clears operational state and records the new generation atomically.
+        tracker_entries = self._probation_tracker.clear_all()
+        empty_strikes = HardProofStrikeTracker(
+            failure_epochs_for_penalty=policy.failure_epochs_for_penalty,
+            clean_hard_audit_epochs_for_reset=(
+                policy.clean_hard_audit_epochs_for_reset
+            ),
+        )
+        result = self._db.reset_operational_probation_state(
+            target,
+            effective_epoch=reset_epoch,
+            hard_failure_strikes_json=empty_strikes.to_json(),
+        )
+        if not result.get("applied"):
+            return False
+        with self._hard_failure_strike_lock:
+            self._hard_failure_strikes = empty_strikes
+        with self._probation_recovery_epoch_lock:
+            self._last_probation_recovery_source_epoch = {}
+        self._probation_state_reset_effective_epoch = reset_epoch
+        self._write_shared_state()
+        bt.logging.info(
+            "Applied probation state generation "
+            f"{current}->{target} effective_epoch={reset_epoch}: "
+            f"tracker={tracker_entries} "
+            f"db={result['probation_entries_cleared']} "
+            f"pending_capacity={result['capacity_events_consumed']}"
+        )
+        return True
+
     def _load_hard_failure_strikes(self) -> None:
         try:
             raw = self._db.get_meta("proof_v3_hard_failure_strikes_v1")
@@ -5894,6 +5981,14 @@ class ValidatorNeuron:
         force_penalty: bool = False,
     ) -> bool:
         """Return whether this failed source epoch carries a consequence."""
+
+        if self._probation_reset_covers_source_epoch(source_epoch):
+            bt.logging.info(
+                "Ignoring pre-reset proof-v3 hard-failure consequence for "
+                f"{key[0][:10]} model_index={key[1]} "
+                f"source_epoch={int(source_epoch)}"
+            )
+            return False
 
         policy = self._hard_failure_policy()
         with self._hard_failure_strike_lock:
@@ -7725,6 +7820,7 @@ class ValidatorNeuron:
                             test.miner_address,
                             test.model_index,
                             endpoint=test.miner_endpoint,
+                            source_epoch=epoch_number,
                         )
                 return
             kind = "full" if test.test_type == "full_context" else "low"
@@ -8395,6 +8491,7 @@ class ValidatorNeuron:
                                 test.miner_address,
                                 test.model_index,
                                 endpoint=test.miner_endpoint,
+                                source_epoch=epoch_number,
                             )
                         if (
                             penalty_required
@@ -8525,6 +8622,7 @@ class ValidatorNeuron:
                             self._on_proof_failure(
                                 test.miner_address, test.model_index,
                                 endpoint=test.miner_endpoint,
+                                source_epoch=epoch_number,
                             )
                             self._canary_penalized_keys.add(
                                 self._miner_model_key(
@@ -8840,6 +8938,7 @@ class ValidatorNeuron:
                         test.miner_address,
                         test.model_index,
                         endpoint=test.miner_endpoint,
+                        source_epoch=epoch_number,
                     )
                 if (
                     penalty_required
@@ -8940,6 +9039,7 @@ class ValidatorNeuron:
                         test.miner_address,
                         test.model_index,
                         endpoint=test.miner_endpoint,
+                        source_epoch=epoch_number,
                     )
 
             # Log error to analytics DB
@@ -9578,7 +9678,7 @@ class ValidatorNeuron:
             suppress_probation = self._maintenance_grace_active(
                 current_epoch=epoch_number,
                 action="suppress_probation",
-            )
+            ) or self._probation_reset_covers_source_epoch(epoch_number)
             prior_full_debt = key in self._full_context_debt
             pending_full = self._pending_cross_epoch_full_obligations(
                 epoch_number,
@@ -9647,6 +9747,7 @@ class ValidatorNeuron:
                         miner.address,
                         miner.model_index,
                         endpoint=getattr(miner, "endpoint", ""),
+                        source_epoch=epoch_number,
                     )
                     canary_penalized_keys.add(key)
                 bt.logging.info(
@@ -9806,7 +9907,7 @@ class ValidatorNeuron:
             suppress_score_zeroing = self._maintenance_grace_active(
                 current_epoch=epoch_number,
                 action="suppress_score_zeroing",
-            )
+            ) or self._probation_reset_covers_source_epoch(epoch_number)
             epoch_score = self.scorer.update(
                 uid=uid,
                 address=miner.address,
@@ -11593,6 +11694,8 @@ class ValidatorNeuron:
         miner_address: str,
         model_index: int,
         endpoint: str = "",
+        *,
+        source_epoch: int | None = None,
     ):
         """Mid-epoch cutoff: immediately put miner on probation and notify proxy.
 
@@ -11602,6 +11705,21 @@ class ValidatorNeuron:
         offenders while keeping single failures recoverable.
         """
         key = self._miner_model_key(miner_address, model_index)
+        close_epoch = int(
+            source_epoch
+            if source_epoch is not None
+            else self._epoch_close_value(
+                "_current_epoch",
+                getattr(self, "_current_epoch", 0),
+            )
+        )
+        if self._probation_reset_covers_source_epoch(close_epoch):
+            bt.logging.info(
+                "Ignoring pre-reset proof-failure consequence for "
+                f"{miner_address[:10]} model_index={model_index} "
+                f"source_epoch={close_epoch}"
+            )
+            return
         if self._maintenance_grace_active(action="suppress_probation"):
             bt.logging.info(
                 f"Maintenance grace suppressed proof-failure probation for "
@@ -11624,9 +11742,6 @@ class ValidatorNeuron:
             _ss58 = self._get_miner_ss58(miner_address, "hotkey") or ""
         except Exception:
             pass
-        close_epoch = int(
-            self._epoch_close_value("_current_epoch", self._current_epoch)
-        )
         if not self._probation_tracker.is_on_probation(key):
             self._probation_tracker.enter_probation(key, close_epoch, endpoint=endpoint)
             self._db.enter_probation(
