@@ -1768,6 +1768,7 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
             extract_execution_anchor_range_v3,
             required_execution_anchor_lanes_v3,
             runtime_attention_quantized_row_v3,
+            runtime_kv_head_quantization_bounds_v3,
             runtime_kv_head_quantized_v3,
         )
         from verallm.proof_v3.scored_attention_reference import (
@@ -1952,6 +1953,7 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
             )
 
         kv_head_cache = {}
+        kv_head_bounds_cache = {}
 
         def _anchor_kv(
             layer: int,
@@ -2049,6 +2051,10 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
                             encoding_id=anchor_encoding,
                         )
                     )
+                    kv_head_bounds_cache[cache_key] = (
+                        kv_head_cache[cache_key],
+                        kv_head_cache[cache_key],
+                    )
                 else:
                     kv_head_cache[cache_key] = runtime_kv_head_quantized_v3(
                         tag=tag,
@@ -2061,7 +2067,39 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
                         params_by_head=params_by_layer[int(layer)],
                         encoding_id=anchor_encoding,
                     )
+                    kv_head_bounds_cache[cache_key] = (
+                        runtime_kv_head_quantization_bounds_v3(
+                            tag=tag,
+                            raw_head_bytes=raw_head,
+                            layer=int(layer),
+                            position=position,
+                            kv_head=kv_head,
+                            geometry=geometry,
+                            semantics=semantics,
+                            params_by_head=params_by_layer[int(layer)],
+                            encoding_id=anchor_encoding,
+                        )
+                    )
             return int(kv_head_cache[cache_key][coordinate])
+
+        def _anchor_kv_bounds(
+            layer: int,
+            tag: str,
+            native_leaf: int,
+            sp: int,
+            dim: int,
+        ) -> tuple[int, int]:
+            kv_head, remainder = divmod(
+                int(native_leaf), int(sp) * int(dim)
+            )
+            position, coordinate = divmod(remainder, int(dim))
+            if kv_head >= n_kv or position >= key_count:
+                return 0, 0
+            _anchor_kv(layer, tag, native_leaf, sp, dim)
+            lower, upper = kv_head_bounds_cache[
+                (int(layer), tag, kv_head, position)
+            ]
+            return int(lower[coordinate]), int(upper[coordinate])
 
         anchor_kv_value = _anchor_kv
         anchor_q13_head_row = _anchor_q13_head_row
@@ -2087,6 +2125,9 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
             economic_ox8_head_row=_economic_ox8_head_row,
             anchor_roots_by_layer=anchor_roots_by_layer,
             anchor_kv_value=anchor_kv_value,
+            anchor_kv_bounds=(
+                _anchor_kv_bounds if streaming else None
+            ),
             anchor_q13_head_row=anchor_q13_head_row,
             pcs_query_count=challenge.pcs_query_count,
             anchor_gate_fx_head_row=anchor_gate_fx_head_row,
