@@ -78,7 +78,7 @@ def _decode(version: int) -> tuple[int, int, int]:
 
 MINER_MAJOR = 0
 MINER_MINOR = 1
-MINER_PATCH = 5
+MINER_PATCH = 6
 
 miner_version: int = _encode(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)

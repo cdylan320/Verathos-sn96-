@@ -29,6 +29,7 @@ import argparse
 import json
 import logging
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -77,6 +78,129 @@ PROOF_V3_RELEASE_ENV = "VERATHOS_PROOF_V3_RELEASE"
 
 PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS = 60.0
 PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS = 5.0
+
+_MANAGED_NGINX_CONFIG_PATHS = (
+    Path("/etc/nginx/sites-available/verathos-miner"),
+    Path("/etc/nginx/sites-enabled/verathos-miner"),
+    Path("/etc/nginx/nginx.conf"),
+)
+_MANAGED_NGINX_OLD_READ_TIMEOUT = "proxy_read_timeout 120s;"
+_MANAGED_NGINX_READ_TIMEOUT = "proxy_read_timeout 360s;"
+
+
+def _reconcile_managed_nginx_read_timeout(
+    *,
+    config_paths: tuple[Path, ...] = _MANAGED_NGINX_CONFIG_PATHS,
+    run_command: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> bool:
+    """Align the stock HTTPS proxy with the signed hard-proof deadline.
+
+    The hard-proof response budget is 300 seconds.  Older versions of the
+    stock nginx template used a 120-second upstream read timeout, which could
+    terminate a valid long-decode proof before the validator deadline.  Only
+    byte-recognizable Verathos-managed server blocks are migrated; custom
+    reverse-proxy configurations are never rewritten.
+    """
+
+    managed_marker = "ssl_certificate /etc/nginx/ssl/miner.crt;"
+    backend_marker = "proxy_pass http://127.0.0.1:"
+    changed: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+
+    for candidate in config_paths:
+        try:
+            path = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            original = path.read_text()
+        except (OSError, UnicodeError):
+            continue
+        if _MANAGED_NGINX_READ_TIMEOUT in original:
+            continue
+        if _MANAGED_NGINX_OLD_READ_TIMEOUT not in original:
+            continue
+        if managed_marker not in original or backend_marker not in original:
+            bt.logging.warning(
+                f"Custom nginx config {path} retains a 120s read timeout; "
+                "set the proof-v3 upstream timeout to at least 360s"
+            )
+            continue
+        if original.count(_MANAGED_NGINX_OLD_READ_TIMEOUT) != 1:
+            bt.logging.warning(
+                f"Managed nginx config {path} has an ambiguous read timeout; "
+                "set the proof-v3 upstream timeout to at least 360s"
+            )
+            continue
+        updated = original.replace(
+            _MANAGED_NGINX_OLD_READ_TIMEOUT,
+            _MANAGED_NGINX_READ_TIMEOUT,
+            1,
+        )
+        temporary = path.with_name(f".{path.name}.verathos-timeout.tmp")
+        try:
+            temporary.write_text(updated)
+            temporary.chmod(path.stat().st_mode & 0o7777)
+            os.replace(temporary, path)
+        except OSError as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            bt.logging.warning(
+                f"Could not update managed nginx timeout in {path}: {exc}; "
+                "set it to at least 360s manually"
+            )
+            continue
+        changed.append((path, original))
+
+    if not changed:
+        return True
+
+    def _run_nginx(*args: str) -> subprocess.CompletedProcess:
+        return run_command(
+            ["nginx", *args],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    try:
+        checked = _run_nginx("-t")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        checked = subprocess.CompletedProcess(
+            ["nginx", "-t"], 1, "", str(exc)
+        )
+    if checked.returncode != 0:
+        for path, original in changed:
+            path.write_text(original)
+        bt.logging.warning(
+            "Managed nginx timeout migration failed validation and was rolled "
+            f"back: {(checked.stderr or checked.stdout).strip()}"
+        )
+        return False
+
+    try:
+        reloaded = _run_nginx("-s", "reload")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        reloaded = subprocess.CompletedProcess(
+            ["nginx", "-s", "reload"], 1, "", str(exc)
+        )
+    if reloaded.returncode != 0:
+        bt.logging.warning(
+            "Managed nginx timeout was updated but nginx reload failed: "
+            f"{(reloaded.stderr or reloaded.stdout).strip()}"
+        )
+        return False
+
+    bt.logging.info(
+        "Updated the managed nginx upstream read timeout to 360s for "
+        "proof-v3 hard responses"
+    )
+    return True
 
 
 def _configured_miner_proof_protocol_versions(
@@ -2153,6 +2277,7 @@ def main():
 
     args, server_args = parse_args()
     setup_neuron_logging(args)
+    _reconcile_managed_nginx_read_timeout()
     _clear_stale_compile_caches()
 
     # The updater executing the first v1 -> v3 fast-forward is still the old
