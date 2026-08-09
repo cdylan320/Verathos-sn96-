@@ -5167,19 +5167,38 @@ class ValidatorNeuron:
 
         # 2. Dispatch pending canary tests
         if self._canary_scheduler is not None:
-            with self._canary_scheduler_lock:
-                pending = self._canary_scheduler.get_pending_tests(block_number)
-            pending = self._defer_capacity_audit_drained_canaries(pending, block_number)
-            if pending:
-                for t in pending:
-                    _uid = self._db.get_uid(t.miner_address)
-                    _uid_str = f"UID {_uid}" if _uid is not None else "UID ?"
-                    bt.logging.debug(
-                        f"Dispatching canary: {_uid_str} {t.miner_address[:10]} "
-                        f"model={t.model_id} type={t.test_type} "
-                        f"proof={t.verify_proof} tokens={t.max_new_tokens}",
+            auto_updater = getattr(self, "_auto_updater", None)
+            update_drain = bool(
+                auto_updater is not None
+                and getattr(auto_updater, "drain_requested", False)
+            )
+            if update_drain:
+                # Preserve the canonical schedule while a detected version
+                # bump drains already admitted work into a safe restart.
+                auto_updater.notify_not_busy()
+            else:
+                with self._canary_scheduler_lock:
+                    pending = self._canary_scheduler.get_pending_tests(
+                        block_number
                     )
-                self._dispatch_canary_tests(pending)
+                pending = self._defer_capacity_audit_drained_canaries(
+                    pending,
+                    block_number,
+                )
+                if pending:
+                    for t in pending:
+                        _uid = self._db.get_uid(t.miner_address)
+                        _uid_str = (
+                            f"UID {_uid}" if _uid is not None else "UID ?"
+                        )
+                        bt.logging.debug(
+                            f"Dispatching canary: {_uid_str} "
+                            f"{t.miner_address[:10]} "
+                            f"model={t.model_id} type={t.test_type} "
+                            f"proof={t.verify_proof} "
+                            f"tokens={t.max_new_tokens}",
+                        )
+                    self._dispatch_canary_tests(pending)
 
         self._schedule_miner_debug_refresh(
             current_epoch=block_number // max(1, int(epoch_blocks)),
@@ -5354,6 +5373,14 @@ class ValidatorNeuron:
                 getattr(self, "_closing_inflight_canaries", {}).values()
             )
             if any(bool(entries) for entries in inflight):
+                return True
+        except RuntimeError:
+            return True
+        try:
+            queued = tuple(
+                getattr(self, "_queued_canaries", {}).values()
+            )
+            if any(bool(entries) for entries in queued):
                 return True
         except RuntimeError:
             return True
@@ -7742,6 +7769,10 @@ class ValidatorNeuron:
                 bt.logging.info(
                     f"Canary test failed for {label}: {e}"
                 )
+            finally:
+                auto_updater = getattr(self, "_auto_updater", None)
+                if auto_updater is not None:
+                    auto_updater.notify_not_busy()
 
         paired: Dict[str, List[CanaryTest]] = {}
         independent: List[CanaryTest] = []
