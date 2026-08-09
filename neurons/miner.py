@@ -33,6 +33,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Callable, Optional
@@ -92,6 +93,7 @@ def _reconcile_managed_nginx_read_timeout(
     *,
     config_paths: tuple[Path, ...] = _MANAGED_NGINX_CONFIG_PATHS,
     run_command: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    effective_uid: int | None = None,
 ) -> bool:
     """Align the stock HTTPS proxy with the signed hard-proof deadline.
 
@@ -104,8 +106,60 @@ def _reconcile_managed_nginx_read_timeout(
 
     managed_marker = "ssl_certificate /etc/nginx/ssl/miner.crt;"
     backend_marker = "proxy_pass http://127.0.0.1:"
-    changed: list[tuple[Path, str]] = []
+    selected_uid = os.geteuid() if effective_uid is None else effective_uid
+    use_sudo = selected_uid != 0
+    changed: list[tuple[Path, str, int]] = []
     seen: set[Path] = set()
+
+    def _install_text(path: Path, content: str, mode: int) -> bool:
+        if not use_sudo:
+            temporary = path.with_name(f".{path.name}.verathos-timeout.tmp")
+            try:
+                temporary.write_text(content)
+                temporary.chmod(mode)
+                os.replace(temporary, path)
+                return True
+            except OSError:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
+
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="verathos-nginx-timeout-",
+                delete=False,
+            ) as temporary:
+                temporary.write(content)
+                temporary_name = temporary.name
+            installed = run_command(
+                [
+                    "sudo",
+                    "-n",
+                    "install",
+                    "-m",
+                    f"{mode:o}",
+                    "--",
+                    temporary_name,
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return installed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        finally:
+            if temporary_name is not None:
+                try:
+                    Path(temporary_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     for candidate in config_paths:
         try:
@@ -140,29 +194,29 @@ def _reconcile_managed_nginx_read_timeout(
             _MANAGED_NGINX_READ_TIMEOUT,
             1,
         )
-        temporary = path.with_name(f".{path.name}.verathos-timeout.tmp")
         try:
-            temporary.write_text(updated)
-            temporary.chmod(path.stat().st_mode & 0o7777)
-            os.replace(temporary, path)
+            mode = path.stat().st_mode & 0o7777
         except OSError as exc:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
             bt.logging.warning(
-                f"Could not update managed nginx timeout in {path}: {exc}; "
+                f"Could not inspect managed nginx config {path}: {exc}; "
                 "set it to at least 360s manually"
             )
             continue
-        changed.append((path, original))
+        if not _install_text(path, updated, mode):
+            bt.logging.warning(
+                f"Could not update managed nginx timeout in {path}; "
+                "passwordless sudo is required for a non-root official install"
+            )
+            continue
+        changed.append((path, original, mode))
 
     if not changed:
         return True
 
     def _run_nginx(*args: str) -> subprocess.CompletedProcess:
+        prefix = ["sudo", "-n"] if use_sudo else []
         return run_command(
-            ["nginx", *args],
+            [*prefix, "nginx", *args],
             capture_output=True,
             text=True,
             timeout=15,
@@ -175,11 +229,15 @@ def _reconcile_managed_nginx_read_timeout(
             ["nginx", "-t"], 1, "", str(exc)
         )
     if checked.returncode != 0:
-        for path, original in changed:
-            path.write_text(original)
+        rollback_results = [
+            _install_text(path, original, mode)
+            for path, original, mode in changed
+        ]
+        rollback_ok = all(rollback_results)
         bt.logging.warning(
             "Managed nginx timeout migration failed validation and was rolled "
-            f"back: {(checked.stderr or checked.stdout).strip()}"
+            f"back{'' if rollback_ok else ' incompletely'}: "
+            f"{(checked.stderr or checked.stdout).strip()}"
         )
         return False
 
