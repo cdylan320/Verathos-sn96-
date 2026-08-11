@@ -85,8 +85,11 @@ _MANAGED_NGINX_CONFIG_PATHS = (
     Path("/etc/nginx/sites-enabled/verathos-miner"),
     Path("/etc/nginx/nginx.conf"),
 )
-_MANAGED_NGINX_OLD_READ_TIMEOUT = "proxy_read_timeout 120s;"
-_MANAGED_NGINX_READ_TIMEOUT = "proxy_read_timeout 360s;"
+_MANAGED_NGINX_OLD_READ_TIMEOUTS = (
+    "proxy_read_timeout 120s;",
+    "proxy_read_timeout 360s;",
+)
+_MANAGED_NGINX_READ_TIMEOUT = "proxy_read_timeout 540s;"
 
 
 def _reconcile_managed_nginx_read_timeout(
@@ -97,10 +100,10 @@ def _reconcile_managed_nginx_read_timeout(
 ) -> bool:
     """Align the stock HTTPS proxy with the signed hard-proof deadline.
 
-    The hard-proof response budget is 300 seconds.  Older versions of the
-    stock nginx template used a 120-second upstream read timeout, which could
-    terminate a valid long-decode proof before the validator deadline.  Only
-    byte-recognizable Verathos-managed server blocks are migrated; custom
+    The authenticated hard-proof response budget reaches 480 seconds for the
+    largest qualified decode geometry. Older stock templates used 120 or 360
+    seconds and could terminate a valid proof before the validator deadline.
+    Only byte-recognizable Verathos-managed server blocks are migrated; custom
     reverse-proxy configurations are never rewritten.
     """
 
@@ -175,22 +178,30 @@ def _reconcile_managed_nginx_read_timeout(
             continue
         if _MANAGED_NGINX_READ_TIMEOUT in original:
             continue
-        if _MANAGED_NGINX_OLD_READ_TIMEOUT not in original:
+        old_timeouts = tuple(
+            value
+            for value in _MANAGED_NGINX_OLD_READ_TIMEOUTS
+            if value in original
+        )
+        if not old_timeouts:
             continue
         if managed_marker not in original or backend_marker not in original:
             bt.logging.warning(
-                f"Custom nginx config {path} retains a 120s read timeout; "
-                "set the proof-v3 upstream timeout to at least 360s"
+                f"Custom nginx config {path} retains an old read timeout; "
+                "set the proof-v3 upstream timeout to at least 540s"
             )
             continue
-        if original.count(_MANAGED_NGINX_OLD_READ_TIMEOUT) != 1:
+        if (
+            len(old_timeouts) != 1
+            or original.count(old_timeouts[0]) != 1
+        ):
             bt.logging.warning(
                 f"Managed nginx config {path} has an ambiguous read timeout; "
-                "set the proof-v3 upstream timeout to at least 360s"
+                "set the proof-v3 upstream timeout to at least 540s"
             )
             continue
         updated = original.replace(
-            _MANAGED_NGINX_OLD_READ_TIMEOUT,
+            old_timeouts[0],
             _MANAGED_NGINX_READ_TIMEOUT,
             1,
         )

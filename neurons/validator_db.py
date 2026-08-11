@@ -20,6 +20,7 @@ import math
 import bittensor as bt
 import os
 import sqlite3
+import statistics
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -4260,6 +4261,46 @@ class ValidatorStateDB:
                 score = 0.01  # active but not yet scored — allow routing
             miner_scores[addr][idx_str] = score
 
+        # Use only this validator's accepted receipts.  This is the same
+        # validator-observed timing source used by scoring, without trusting a
+        # miner-reported TPS value.  Very short completions are excluded
+        # because setup/TTFT dominates them and makes decode speed noisy.
+        recent_tps: Dict[Tuple[str, int], List[float]] = {}
+        recent_ttft: Dict[Tuple[str, int], List[float]] = {}
+        with self._lock:
+            tps_rows = self._conn.execute(
+                """SELECT LOWER(miner_address) AS miner_address,
+                          model_index, tokens_generated,
+                          generation_time_ms, ttft_ms
+                   FROM network_receipts
+                   WHERE epoch_number BETWEEN ? AND ?
+                     AND is_own = 1
+                     AND tokens_generated >= 32
+                     AND generation_time_ms > ttft_ms
+                     AND (proof_requested = 0 OR proof_verified = 1)""",
+                (max(0, int(epoch) - 2), int(epoch)),
+            ).fetchall()
+        for row in tps_rows:
+            key = (str(row["miner_address"]).lower(), int(row["model_index"]))
+            output_tokens = int(row["tokens_generated"])
+            decode_ms = float(row["generation_time_ms"]) - float(row["ttft_ms"])
+            if output_tokens <= 1 or decode_ms <= 0.0:
+                continue
+            recent_tps.setdefault(key, []).append(
+                (output_tokens - 1) / (decode_ms / 1000.0)
+            )
+            recent_ttft.setdefault(key, []).append(float(row["ttft_ms"]))
+        miner_tps: Dict[str, Dict[str, float]] = {}
+        for (addr, model_index), values in recent_tps.items():
+            miner_tps.setdefault(addr, {})[str(model_index)] = float(
+                statistics.median(values)
+            )
+        miner_ttft_ms: Dict[str, Dict[str, float]] = {}
+        for (addr, model_index), values in recent_ttft.items():
+            miner_ttft_ms.setdefault(addr, {})[str(model_index)] = float(
+                statistics.median(values)
+            )
+
         # Build miner_endpoints from active entries only — inactive miners
         # should not be listed as routable endpoints.
         miner_endpoints: List[MinerEntry] = []
@@ -4291,6 +4332,8 @@ class ValidatorStateDB:
             epoch_number=epoch,
             epoch_start_block=start_block,
             miner_scores=miner_scores,
+            miner_tps=miner_tps,
+            miner_ttft_ms=miner_ttft_ms,
             probation_miners=probation,
             miner_endpoints=miner_endpoints,
             audit_drains=audit_drains,
