@@ -1945,9 +1945,9 @@ def parse_args():
     parser.add_argument("--chain-config", default=None,
                         help="Path to chain config JSON. If omitted, derived from --subtensor-network.")
     parser.add_argument("--subtensor-network", default=None,
-                        help="Bittensor network name (test or finney). Selects chain config (contracts) and default RPC URL.")
+                        help="Bittensor network name (test or finney). Selects chain config and default RPC URL.")
     parser.add_argument("--subtensor-chain-endpoint", default=None,
-                        help="Explicit Substrate+EVM RPC endpoint (e.g. http://localhost:9944 for local subtensor).")
+                        help="Explicit Substrate+EVM endpoint. Public RPCs are not recommended for stable mining.")
     parser.add_argument("--endpoint", required=True, help="Public miner endpoint URL")
     parser.add_argument("--skip-external-port-check", action="store_true",
                         help="Skip the public endpoint reachability preflight. "
@@ -2394,9 +2394,17 @@ def main():
     )
     bt.logging.info(f"Model config: {resolved.model_id} quant={resolved.quant} ctx={resolved.max_context_len}")
 
-    # Resolve EVM RPC URL: explicit endpoint > network default > JSON default
+    explicit_chain_endpoint = getattr(args, "subtensor_chain_endpoint", None)
+    if ChainConfig.should_warn_public_rpc(explicit_chain_endpoint):
+        bt.logging.warning(
+            "Public Bittensor RPC configured. Public endpoints are rate-limited "
+            "and may make miner registration, heartbeats, and capacity audits "
+            "unstable. For production mining, run a Subtensor node and pass "
+            "its endpoint with --subtensor-chain-endpoint."
+        )
+
     rpc_override = ChainConfig.resolve_rpc_url(
-        getattr(args, "subtensor_chain_endpoint", None),
+        explicit_chain_endpoint,
         args.subtensor_network,
     )
     chain_config = ChainConfig.from_json(
@@ -2408,8 +2416,8 @@ def main():
             setattr(config, k, getattr(chain_config, k))
 
     # Set Substrate network from CLI args
-    if getattr(args, "subtensor_chain_endpoint", None):
-        ep = args.subtensor_chain_endpoint
+    if explicit_chain_endpoint:
+        ep = explicit_chain_endpoint
         ws_ep = ep.replace("http://", "ws://").replace("https://", "wss://")
         config.subtensor_network = ws_ep
     elif args.subtensor_network:
