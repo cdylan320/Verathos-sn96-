@@ -471,16 +471,19 @@ def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
     if not local_head or not remote_head:
         return None
 
-    # No new commits at all — skip version parsing
-    if local_head == remote_head:
-        return None
-
-    # New commits exist — check if our role's version changed
     var_name = "miner_version" if role == "miner" else "validator_version"
 
     # Local version (from the imported module)
     from neurons.version import miner_version, validator_version
     local_version = miner_version if role == "miner" else validator_version
+
+    # Validators and proxies retain the established checkout-based fast path.
+    # A stock multi-endpoint miner is different: several resident processes
+    # share one checkout, so one sibling may advance HEAD while the others
+    # still execute an older imported miner version.  Those siblings must keep
+    # comparing their in-memory version with the remote release and restart.
+    if local_head == remote_head and role != "miner":
+        return None
 
     # Remote version (from git show, without pulling)
     remote_source = _read_remote_version_file()
@@ -496,11 +499,16 @@ def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
         return None
 
     if remote_version > local_version:
-        bt.logging.info(f"Remote {var_name}={remote_version} > local {local_version} (commits: {local_head[:8]}→{remote_head[:8]})")
+        bt.logging.info(
+            f"Remote {var_name}={remote_version} > running {local_version} "
+            f"(commits: {local_head[:8]}→{remote_head[:8]})"
+        )
         return (remote_head, remote_version, local_version)
 
-    # New commits but our role's version didn't change — skip
-    bt.logging.debug(f"New commits available ({local_head[:8]}→{remote_head[:8]}) but {var_name} unchanged ({local_version}) — skipping")
+    bt.logging.debug(
+        f"Remote {var_name}={remote_version} does not exceed running "
+        f"{local_version} (commits: {local_head[:8]}→{remote_head[:8]}) — skipping"
+    )
     return None
 
 
