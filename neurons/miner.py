@@ -271,7 +271,7 @@ def _reconcile_managed_nginx_read_timeout(
         return False
 
     bt.logging.info(
-        "Updated the managed nginx upstream read timeout to 360s for "
+        "Updated the managed nginx upstream read timeout to 540s for "
         "proof-v3 hard responses"
     )
     return True
