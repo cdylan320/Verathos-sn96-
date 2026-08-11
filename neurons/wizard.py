@@ -1210,12 +1210,20 @@ def _parse_existing_config(repo: Path) -> list[dict]:
         return []
 
     miners = []
-    # Find miner app entries by looking for neurons.miner in args
-    # Simple regex-based parsing of the JS config
-    for m in re.finditer(r'name:\s*["\']([^"\']*miner[^"\']*)["\']', text):
+    # Find miner app entries by looking for their PM2 names.  Slice each
+    # complete app entry rather than a fixed prefix: the capacity-audit env
+    # can place CUDA_VISIBLE_DEVICES several kilobytes after ``args``.
+    matches = list(
+        re.finditer(r'name:\s*["\']([^"\']*miner[^"\']*)["\']', text)
+    )
+    for index, m in enumerate(matches):
         name = m.group(1)
-        # Find the args line near this match (and its env block, if any)
-        section = text[m.start():m.start() + 800]
+        section_end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(text)
+        )
+        section = text[m.start():section_end]
         args_m = re.search(r'args:\s*["\']([^"\']*)["\']', section)
         if args_m:
             args_str = args_m.group(1)
@@ -1234,7 +1242,8 @@ def _parse_existing_config(repo: Path) -> list[dict]:
             # Extract CUDA_VISIBLE_DEVICES from env block (set by the wizard
             # for multi-GPU isolation). Falls through to None if absent.
             cvd_m = re.search(
-                r'CUDA_VISIBLE_DEVICES\s*:\s*["\']([^"\']*)["\']', section,
+                r'["\']?CUDA_VISIBLE_DEVICES["\']?\s*:\s*["\']([^"\']*)["\']',
+                section,
             )
             if cvd_m:
                 entry["cuda_device"] = cvd_m.group(1)
@@ -2474,12 +2483,18 @@ def run_wizard(role: str = "miner") -> None:
                         # Check if GPU is already assigned to an existing endpoint
                         in_use = False
                         for em in existing_miners:
-                            args = em.get("args", "")
-                            # If no CUDA_VISIBLE_DEVICES in args, GPU 0 is implied
-                            if "CUDA_VISIBLE_DEVICES" not in args and i == 0:
+                            cuda_device = em.get("cuda_device")
+                            # If no env assignment exists, vLLM implicitly
+                            # selects GPU 0.
+                            if cuda_device is None and i == 0:
                                 in_use = True
-                            elif f"CUDA_VISIBLE_DEVICES" in args and str(i) in args:
-                                in_use = True
+                            elif cuda_device is not None:
+                                try:
+                                    in_use = int(cuda_device) == i
+                                except (TypeError, ValueError):
+                                    pass
+                            if in_use:
+                                break
                         status = f" {yellow('(in use)')}" if in_use else ""
                         print(f"    [{i}] {p.name} ({p.total_memory / (1024**3):.0f} GB){status}")
             except ImportError:
