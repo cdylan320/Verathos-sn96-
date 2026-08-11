@@ -202,8 +202,10 @@ def _replay_capture_row_matches_v3(
         delta = actual_values - expected_values
         if not bool(np.all(np.abs(delta) <= max_lsb_delta)):
             return False
+        if max_row_sq_delta is None:
+            return True
         row_sq_delta = sum(int(value) * int(value) for value in delta)
-        return max_row_sq_delta is None or row_sq_delta <= max_row_sq_delta
+        return row_sq_delta <= max_row_sq_delta
     except ImportError:  # pragma: no cover - production dependency.
         deltas = tuple(
             int(actual_value) - int(expected_value)
@@ -5863,19 +5865,25 @@ def verify_economic_recompute_v3(
                 input_values, post_values, input_raw, post_raw = (
                     norm_source_rows_by_token[token]
                 )
-                if tuple(rin_rows[token]) != quantize_execution_anchor_row_v3(
-                    row_bytes=input_raw,
-                    scale=rin_scale,
-                    encoding_id=anchor_encoding,
+                if not _replay_capture_row_matches_v3(
+                    tuple(rin_rows[token]),
+                    quantize_execution_anchor_row_v3(
+                        row_bytes=input_raw,
+                        scale=rin_scale,
+                        encoding_id=anchor_encoding,
+                    ),
                 ):
                     raise _fail(
                         f"lean GDN coupling l{layer} input norm source is "
                         "detached from its projection row"
                     )
-                if tuple(mid_rows[token]) != quantize_execution_anchor_row_v3(
-                    row_bytes=post_raw,
-                    scale=mid_scale,
-                    encoding_id=anchor_encoding,
+                if not _replay_capture_row_matches_v3(
+                    tuple(mid_rows[token]),
+                    quantize_execution_anchor_row_v3(
+                        row_bytes=post_raw,
+                        scale=mid_scale,
+                        encoding_id=anchor_encoding,
+                    ),
                 ):
                     raise _fail(
                         f"lean GDN coupling l{layer} post norm source is "

@@ -1335,6 +1335,12 @@ def _generate_miner_entry(
 
     env = dict(capacity_audit_env or {})
     env.setdefault("PATH", _runtime_path_with_venv(repo_root))
+    if str(quant or "").strip().lower().replace("-", "_").startswith("fp8"):
+        # Persist the proof-qualified backend selection in every PM2 entry.
+        # This must not depend on the setup shell still having .env.sh sourced
+        # when a sibling endpoint or a resurrected PM2 process starts.
+        env["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] = "0"
+        env["VLLM_USE_DEEP_GEMM"] = "0"
     if cuda_device:
         env["CUDA_VISIBLE_DEVICES"] = cuda_device
     env_block = _format_env_block(env)

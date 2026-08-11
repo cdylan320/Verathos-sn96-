@@ -1432,6 +1432,33 @@ def _resolve_sampling_params(
     }
 
 
+def _private_vllm_sampling_seed(
+    canonical_seed: bytes | None = None,
+) -> int:
+    """Return a private per-request seed for vLLM's CUDA sampler.
+
+    vLLM uses the process-global CUDA generator whenever any sampled request
+    has no seed. A failed CUDA-graph capture can leave that generator in
+    PyTorch's capture state, causing every later unseeded sample to fail even
+    though the engine itself remains usable. Giving every stochastic request
+    its own generator avoids that process-global failure mode. The canonical
+    proof seed remains unchanged and is only domain-separated for vLLM's
+    internal draw; unaudited stochastic requests receive fresh private
+    entropy without adding proof capture work.
+    """
+
+    if canonical_seed is None:
+        material = os.urandom(32)
+    else:
+        if not isinstance(canonical_seed, bytes) or len(canonical_seed) != 32:
+            raise ValueError("canonical sampling seed must contain 32 bytes")
+        material = canonical_seed
+    digest = hashlib.sha256(
+        b"verathos.vllm.private_sampling_seed.v1\x00" + material
+    ).digest()
+    return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
+
+
 def _chat_template_kwargs(tokenizer, enable_thinking: bool = True) -> dict:
     """Extra kwargs for apply_chat_template based on model capabilities.
 
@@ -2898,9 +2925,10 @@ async def _stream_inference(
         )
         moe_hook_mgr.install_hooks()
 
-    sampling_params = SamplingParams(
-        **_resolve_sampling_params(body, state.model_name),
-    )
+    _resolved_sp = _resolve_sampling_params(body, state.model_name)
+    if body.do_sample:
+        _resolved_sp["seed"] = _private_vllm_sampling_seed()
+    sampling_params = SamplingParams(**_resolved_sp)
 
     engine = miner.llm.llm_engine
     t_infer = time.perf_counter()
@@ -3918,6 +3946,8 @@ async def _stream_inference_batched(
 
         # Resolve sampling params and build canonical sampler if do_sample=True.
         _resolved_sp = _resolve_sampling_params(body, state.model_name)
+        if body.do_sample:
+            _resolved_sp["seed"] = _private_vllm_sampling_seed(_seed_bytes)
 
         sampling_params = SamplingParams(**_resolved_sp)
         # vLLM owns the object passed to add_request.  Keep an independent,
