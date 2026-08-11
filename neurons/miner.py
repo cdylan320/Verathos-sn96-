@@ -191,9 +191,15 @@ def _reconcile_managed_nginx_read_timeout(
                 "set the proof-v3 upstream timeout to at least 540s"
             )
             continue
+        old_count = original.count(old_timeouts[0]) if len(old_timeouts) == 1 else 0
+        current_count = original.count(_MANAGED_NGINX_READ_TIMEOUT)
+        managed_count = original.count(managed_marker)
+        backend_count = original.count(backend_marker)
         if (
             len(old_timeouts) != 1
-            or original.count(old_timeouts[0]) != 1
+            or old_count < 1
+            or managed_count != backend_count
+            or managed_count != old_count + current_count
         ):
             bt.logging.warning(
                 f"Managed nginx config {path} has an ambiguous read timeout; "
@@ -203,7 +209,6 @@ def _reconcile_managed_nginx_read_timeout(
         updated = original.replace(
             old_timeouts[0],
             _MANAGED_NGINX_READ_TIMEOUT,
-            1,
         )
         try:
             mode = path.stat().st_mode & 0o7777

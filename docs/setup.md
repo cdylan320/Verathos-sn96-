@@ -242,7 +242,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_buffering off;
         # Hard proofs have an authenticated 300-second response budget.
-        proxy_read_timeout 360s;
+        proxy_read_timeout 540s;
     }
 }
 ```
@@ -277,7 +277,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_buffering off;
         # Hard proofs have an authenticated 300-second response budget.
-        proxy_read_timeout 360s;
+        proxy_read_timeout 540s;
     }
 }
 ```
