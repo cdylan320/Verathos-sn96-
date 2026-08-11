@@ -2829,7 +2829,7 @@ def main():
 
     # ── Auto-updater ──
     if args.auto_update:
-        from neurons.auto_update import AutoUpdater
+        from neurons.auto_update import AutoUpdater, derive_jitter_seed
 
         def _miner_busy() -> bool:
             return neuron._auto_update_busy(local_health_url)
@@ -2839,7 +2839,10 @@ def main():
             check_interval=args.auto_update_interval,
             busy_check=_miner_busy,
             jitter_seconds=args.auto_update_jitter,
-            jitter_seed=neuron.hotkey_seed,
+            jitter_seed=derive_jitter_seed(
+                neuron.hotkey_seed,
+                _extract_server_port(server_args),
+            ),
         )
         updater.start()
 
