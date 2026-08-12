@@ -16,8 +16,7 @@ Lifecycle:
 5. After epoch + grace window:
    a. Pull all receipts from each miner: GET /epoch/{n}/receipts.
    b. Build EpochOutcome per miner-model entry.
-   c. Score entries: utility × throughput² × latency, update EMAs.
-   d. Apply traffic volume multiplier.
+   c. Score entries: utility × authenticated work × latency, update EMAs.
 6. At weight-setting boundary:
    a. Compute per-UID weights (additive aggregation × traffic volume).
    b. ``set_weights()`` on Substrate.
@@ -126,6 +125,7 @@ from neurons.scoring import (
     compute_model_base_utility,
     compute_model_demand,
     compute_peer_medians,
+    select_scoring_authority_receipts,
 )
 from neurons.validator_db import ValidatorStateDB
 from neurons.proof_v3_failure_strikes import HardProofStrikeTracker
@@ -159,6 +159,17 @@ _PROOF_V3_ARTIFACT_REFRESH_SECONDS = 3600.0
 
 class _ProofV3ValidatorConfigurationError(RuntimeError):
     """Local v3 configuration is unavailable; the miner is not at fault."""
+
+
+def _decode_scoring_authority_hotkey(ss58_address: str) -> bytes:
+    """Decode one exact Substrate account id or fail closed."""
+
+    from verallm.chain.wallet import ss58_decode
+
+    authority = bytes(ss58_decode(str(ss58_address or "")))
+    if len(authority) != 32:
+        raise ValueError("decoded scoring authority is not 32 bytes")
+    return authority
 
 
 class _ProofV3FullPairBarrier:
@@ -9576,10 +9587,44 @@ class ValidatorNeuron:
         except Exception as e:
             bt.logging.debug(f"Failed to store network receipts: {e}")
 
+        # Only the epoch-latched subnet scoring authority may create organic
+        # throughput and model-demand credit. Other permitted validators still
+        # contribute independently authenticated canary performance samples,
+        # but cannot manufacture traffic volume for a colluding miner.
+        scoring_authority_hotkey = b""
+        scoring_authority_ss58 = str(
+            self._epoch_close_value(
+                "owner_hotkey_ss58",
+                getattr(
+                    self.config,
+                    "proof_v3_hard_auditor_hotkey_ss58",
+                    "",
+                ),
+            )
+            or ""
+        )
+        try:
+            scoring_authority_hotkey = _decode_scoring_authority_hotkey(
+                scoring_authority_ss58,
+            )
+        except Exception as exc:
+            scoring_authority_hotkey = b""
+            bt.logging.warning(
+                f"Epoch {epoch_number}: scoring authority is unavailable; "
+                f"organic throughput and demand credit are disabled: {exc}"
+            )
+        scoring_authority_receipts = select_scoring_authority_receipts(
+            all_epoch_receipts,
+            scoring_authority_hotkey,
+        )
+
         # ── Compute per-model demand ──────────────────────────────
         demand_scores: Dict[str, int] = {}
         if self.config.demand_bonus_enabled:
-            demand_scores = compute_model_demand(all_epoch_receipts, epoch_number)
+            demand_scores = compute_model_demand(
+                scoring_authority_receipts,
+                epoch_number,
+            )
             if demand_scores:
                 bt.logging.info(f"Epoch {epoch_number} demand scores: {{k: v for k, v in sorted(demand_scores.items(), key=lambda x: -x[1])[:5]}}")
         # Stash for shared state (proxy serves these via /v1/network/stats)
@@ -10063,6 +10108,10 @@ class ValidatorNeuron:
                 expected_own_receipt_count=expected,
                 expected_canary_obligations=expected_inventory,
                 all_receipts=all_receipts,
+                scoring_receipts=select_scoring_authority_receipts(
+                    all_receipts,
+                    scoring_authority_hotkey,
+                ),
                 proof_tests=len(proof_tested) + shared_hard_tests,
                 proof_failures=len(proof_failed) + shared_hard_failures,
                 proof_failure_penalty_required=(
