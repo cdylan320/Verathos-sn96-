@@ -49,6 +49,38 @@ class MaintenanceGraceConfig:
     suppress_proxy_proof_strikes: bool = True
 
 
+DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS = (1, 3)
+LOCAL_PROOF_PROTOCOL_VERSIONS = (1, 3)
+_RESERVED_INFERENCE_PROOF_PROTOCOL_VERSIONS = frozenset({2})
+_MAX_PROOF_PROTOCOL_VERSION = 255
+
+
+@dataclass(frozen=True)
+class ProofProtocolRolloutConfig:
+    """Owner-selected proof protocols, independent of maintenance grace."""
+
+    allowed_protocol_versions: tuple[int, ...] = (
+        DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS
+    )
+
+
+@dataclass(frozen=True)
+class ProofV3HardAuditorConfig:
+    """Epoch-pinned authority allowed to reveal proof-v3 hard nonces."""
+
+    enabled: bool = False
+    validator_hotkey_ss58: str = ""
+
+
+@dataclass(frozen=True)
+class ProofV3FailurePolicyConfig:
+    """Operational consequence policy for miner-attributable hard failures."""
+
+    failure_epochs_for_penalty: int = 1
+    clean_hard_audit_epochs_for_reset: int = 3
+    probation_state_generation: int = 0
+
+
 @dataclass(frozen=True)
 class RuntimeSubnetConfig:
     schema_version: int
@@ -73,6 +105,9 @@ class RuntimeSubnetConfig:
     capacity_audit_slot_refresh_blocks: int
     capacity_audit_slot_snapshot_stale_blocks: int
     capacity_audit_proof_verify_workers: int
+    proof_protocol_rollout: ProofProtocolRolloutConfig
+    proof_v3_hard_auditor: ProofV3HardAuditorConfig
+    proof_v3_failure_policy: ProofV3FailurePolicyConfig
     maintenance_grace: MaintenanceGraceConfig
     payload: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
     source: str = ""
@@ -282,6 +317,157 @@ def _maintenance_grace_to_dict(row: MaintenanceGraceConfig) -> dict[str, Any]:
     return dict(asdict(row))
 
 
+def _proof_protocol_rollout_to_dict(
+    row: ProofProtocolRolloutConfig,
+) -> dict[str, Any]:
+    return {
+        "allowed_protocol_versions": list(row.allowed_protocol_versions),
+    }
+
+
+def _proof_v3_hard_auditor_to_dict(
+    row: ProofV3HardAuditorConfig,
+) -> dict[str, Any]:
+    return dict(asdict(row))
+
+
+def _proof_v3_failure_policy_to_dict(
+    row: ProofV3FailurePolicyConfig,
+) -> dict[str, Any]:
+    return dict(asdict(row))
+
+
+def _parse_proof_v3_failure_policy(
+    payload: Mapping[str, Any],
+) -> ProofV3FailurePolicyConfig:
+    raw = payload.get("proof_v3_failure_policy")
+    if raw is None:
+        # An older hosted config must retain the historical immediate-penalty
+        # behavior rather than silently granting a neutral strike.
+        return ProofV3FailurePolicyConfig()
+    if not isinstance(raw, Mapping):
+        raise SubnetRuntimeConfigError(
+            "proof_v3_failure_policy must be an object"
+        )
+    unknown = set(raw).difference(
+        {
+            "failure_epochs_for_penalty",
+            "clean_hard_audit_epochs_for_reset",
+            "probation_state_generation",
+        }
+    )
+    if unknown:
+        raise SubnetRuntimeConfigError(
+            "proof_v3_failure_policy contains unsupported fields: "
+            + ", ".join(sorted(unknown))
+        )
+    generation = raw.get("probation_state_generation", 0)
+    _reject_bool(generation, "probation_state_generation")
+    if not isinstance(generation, int):
+        raise SubnetRuntimeConfigError(
+            "probation_state_generation must be an integer"
+        )
+    if not 0 <= generation <= 2**31 - 1:
+        raise SubnetRuntimeConfigError(
+            "probation_state_generation must be in [0, 2147483647]"
+        )
+    return ProofV3FailurePolicyConfig(
+        failure_epochs_for_penalty=_require_int(
+            raw,
+            "failure_epochs_for_penalty",
+            minimum=1,
+            maximum=10,
+        ),
+        clean_hard_audit_epochs_for_reset=_require_int(
+            raw,
+            "clean_hard_audit_epochs_for_reset",
+            minimum=1,
+            maximum=100,
+        ),
+        probation_state_generation=int(generation),
+    )
+
+
+def _parse_proof_v3_hard_auditor(
+    payload: Mapping[str, Any],
+) -> ProofV3HardAuditorConfig:
+    raw = payload.get("proof_v3_hard_auditor", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise SubnetRuntimeConfigError(
+            "proof_v3_hard_auditor must be an object"
+        )
+    cfg = ProofV3HardAuditorConfig(
+        enabled=_optional_bool(raw, "enabled", False),
+        validator_hotkey_ss58=_optional_str(
+            raw,
+            "validator_hotkey_ss58",
+            "",
+            maximum_length=128,
+        ),
+    )
+    if cfg.enabled and not cfg.validator_hotkey_ss58:
+        raise SubnetRuntimeConfigError(
+            "enabled proof_v3_hard_auditor requires validator_hotkey_ss58"
+        )
+    return cfg
+
+
+def _parse_proof_protocol_rollout(
+    payload: Mapping[str, Any],
+) -> ProofProtocolRolloutConfig:
+    raw = payload.get("proof_protocol_rollout", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise SubnetRuntimeConfigError("proof_protocol_rollout must be an object")
+
+    unknown = set(raw).difference({"allowed_protocol_versions"})
+    if unknown:
+        raise SubnetRuntimeConfigError(
+            "proof_protocol_rollout contains unsupported fields: "
+            + ", ".join(sorted(unknown))
+        )
+    versions_raw = raw.get(
+        "allowed_protocol_versions",
+        list(DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS),
+    )
+    if not isinstance(versions_raw, list) or not versions_raw:
+        raise SubnetRuntimeConfigError(
+            "proof_protocol_rollout.allowed_protocol_versions must be a "
+            "non-empty list"
+        )
+    versions: list[int] = []
+    for index, value in enumerate(versions_raw):
+        _reject_bool(
+            value,
+            f"proof_protocol_rollout.allowed_protocol_versions[{index}]",
+        )
+        if not isinstance(value, int):
+            raise SubnetRuntimeConfigError(
+                "proof_protocol_rollout.allowed_protocol_versions entries "
+                "must be integers"
+            )
+        version = int(value)
+        if not 1 <= version <= _MAX_PROOF_PROTOCOL_VERSION:
+            raise SubnetRuntimeConfigError(
+                "proof protocol versions must be between 1 and "
+                f"{_MAX_PROOF_PROTOCOL_VERSION}"
+            )
+        if version in _RESERVED_INFERENCE_PROOF_PROTOCOL_VERSIONS:
+            raise SubnetRuntimeConfigError(
+                "inference proof protocol v2 is reserved and cannot be enabled"
+            )
+        versions.append(version)
+    if versions != sorted(set(versions)):
+        raise SubnetRuntimeConfigError(
+            "proof_protocol_rollout.allowed_protocol_versions must be sorted "
+            "and contain no duplicates"
+        )
+    return ProofProtocolRolloutConfig(tuple(versions))
+
+
 def _parse_maintenance_grace(payload: Mapping[str, Any]) -> MaintenanceGraceConfig:
     raw = payload.get("maintenance_grace", {})
     if raw is None:
@@ -332,6 +518,57 @@ def maintenance_grace_active(
             grace.until_unix_ts
         )
     return epoch_active or time_active
+
+
+def legacy_v1_compatibility_active(
+    rollout: ProofProtocolRolloutConfig | None,
+    *,
+    current_epoch: int | None = None,
+    now: float | None = None,
+) -> bool:
+    """Return whether inference proof v1 is currently owner-allowed."""
+
+    del current_epoch, now
+    return proof_protocol_allowed(rollout, 1)
+
+
+def proof_protocol_allowed(
+    rollout: ProofProtocolRolloutConfig | None,
+    version: int,
+) -> bool:
+    """Return whether the owner-selected allowlist admits ``version``."""
+
+    effective = rollout or ProofProtocolRolloutConfig()
+    return int(version) in effective.allowed_protocol_versions
+
+
+def select_proof_protocol_version(
+    rollout: ProofProtocolRolloutConfig | None,
+    *,
+    locally_supported: tuple[int, ...] = LOCAL_PROOF_PROTOCOL_VERSIONS,
+    peer_advertised: tuple[int, ...],
+) -> int | None:
+    """Select the newest mutually supported owner-allowed protocol."""
+
+    effective = rollout or ProofProtocolRolloutConfig()
+    common = (
+        set(int(v) for v in effective.allowed_protocol_versions)
+        .intersection(int(v) for v in locally_supported)
+        .intersection(int(v) for v in peer_advertised)
+    )
+    return max(common) if common else None
+
+
+def proof_v3_required(
+    rollout: ProofProtocolRolloutConfig | None,
+) -> bool:
+    """Return whether this v1/v3 binary must refuse v1 and use v3.
+
+    A future-only allowlist such as ``[4]`` also returns true so an older
+    binary fails closed instead of silently falling back to v1.
+    """
+
+    return not proof_protocol_allowed(rollout, 1)
 
 
 def build_default_subnet_config_payload(
@@ -426,6 +663,9 @@ def build_default_subnet_config_payload(
             "allow_timing_only_score_gate": bool(
                 neuron_config.capacity_audit_allow_timing_only_score_gate
             ),
+            "uid_escalation_enabled": bool(
+                neuron_config.capacity_audit_uid_escalation_enabled
+            ),
             "uid_escalation_min_entries": int(
                 neuron_config.capacity_audit_uid_escalation_min_entries
             ),
@@ -442,6 +682,15 @@ def build_default_subnet_config_payload(
             "proof_verify_workers": int(neuron_config.capacity_audit_proof_verify_workers),
             "gpu_classes": [_gpu_class_to_dict(row) for row in DEFAULT_GPU_CLASSES],
         },
+        "proof_protocol_rollout": _proof_protocol_rollout_to_dict(
+            proof_protocol_rollout_config_from_neuron_config(neuron_config)
+        ),
+        "proof_v3_hard_auditor": _proof_v3_hard_auditor_to_dict(
+            proof_v3_hard_auditor_config_from_neuron_config(neuron_config)
+        ),
+        "proof_v3_failure_policy": _proof_v3_failure_policy_to_dict(
+            proof_v3_failure_policy_config_from_neuron_config(neuron_config)
+        ),
         "maintenance_grace": _maintenance_grace_to_dict(
             maintenance_grace_config_from_neuron_config(neuron_config)
         ),
@@ -521,6 +770,7 @@ def validate_subnet_config_payload(
     audit_data_with_defaults = dict(audit_data)
     audit_data_with_defaults.setdefault("max_proof_payload_bytes", 32 * 1024 * 1024)
     audit_data_with_defaults.setdefault("invalid_proof_misses_for_zero_score", 1)
+    audit_data_with_defaults.setdefault("uid_escalation_enabled", False)
     audit_data_with_defaults.setdefault("uid_escalation_min_entries", 2)
     audit_data_with_defaults.setdefault("uid_escalation_fraction", 0.10)
     audit_data_with_defaults.setdefault("uid_escalation_max_entries", 10)
@@ -578,6 +828,9 @@ def validate_subnet_config_payload(
         allow_timing_only_score_gate=_require_bool(
             audit_data, "allow_timing_only_score_gate"
         ),
+        uid_escalation_enabled=_require_bool(
+            audit_data_with_defaults, "uid_escalation_enabled"
+        ),
         uid_escalation_min_entries=_require_int(
             audit_data_with_defaults, "uid_escalation_min_entries", minimum=1
         ),
@@ -602,6 +855,9 @@ def validate_subnet_config_payload(
         audit_data, "slot_snapshot_stale_blocks", minimum=0
     )
     proof_verify_workers = _require_int(audit_data, "proof_verify_workers", minimum=1)
+    proof_protocol_rollout = _parse_proof_protocol_rollout(payload)
+    proof_v3_hard_auditor = _parse_proof_v3_hard_auditor(payload)
+    proof_v3_failure_policy = _parse_proof_v3_failure_policy(payload)
     maintenance_grace = _parse_maintenance_grace(payload)
 
     normalized = build_default_subnet_config_payload(
@@ -657,6 +913,7 @@ def validate_subnet_config_payload(
             capacity_audit.invalid_proof_misses_for_zero_score
         ),
         "allow_timing_only_score_gate": capacity_audit.allow_timing_only_score_gate,
+        "uid_escalation_enabled": capacity_audit.uid_escalation_enabled,
         "uid_escalation_min_entries": capacity_audit.uid_escalation_min_entries,
         "uid_escalation_fraction": capacity_audit.uid_escalation_fraction,
         "uid_escalation_max_entries": capacity_audit.uid_escalation_max_entries,
@@ -665,6 +922,15 @@ def validate_subnet_config_payload(
         "proof_verify_workers": proof_verify_workers,
         "gpu_classes": [_gpu_class_to_dict(row) for row in gpu_classes],
     }
+    normalized["proof_protocol_rollout"] = _proof_protocol_rollout_to_dict(
+        proof_protocol_rollout
+    )
+    normalized["proof_v3_hard_auditor"] = _proof_v3_hard_auditor_to_dict(
+        proof_v3_hard_auditor
+    )
+    normalized["proof_v3_failure_policy"] = (
+        _proof_v3_failure_policy_to_dict(proof_v3_failure_policy)
+    )
     normalized["maintenance_grace"] = _maintenance_grace_to_dict(maintenance_grace)
 
     return RuntimeSubnetConfig(
@@ -690,6 +956,9 @@ def validate_subnet_config_payload(
         capacity_audit_slot_refresh_blocks=slot_refresh_blocks,
         capacity_audit_slot_snapshot_stale_blocks=slot_snapshot_stale_blocks,
         capacity_audit_proof_verify_workers=proof_verify_workers,
+        proof_protocol_rollout=proof_protocol_rollout,
+        proof_v3_hard_auditor=proof_v3_hard_auditor,
+        proof_v3_failure_policy=proof_v3_failure_policy,
         maintenance_grace=maintenance_grace,
         payload=normalized,
         source=source,
@@ -762,6 +1031,7 @@ def apply_runtime_config_to_neuron_config(
     config.capacity_audit_allow_timing_only_score_gate = (
         audit.allow_timing_only_score_gate
     )
+    config.capacity_audit_uid_escalation_enabled = audit.uid_escalation_enabled
     config.capacity_audit_uid_escalation_min_entries = (
         audit.uid_escalation_min_entries
     )
@@ -777,6 +1047,23 @@ def apply_runtime_config_to_neuron_config(
     )
     config.capacity_audit_proof_verify_workers = (
         runtime.capacity_audit_proof_verify_workers
+    )
+    rollout = runtime.proof_protocol_rollout
+    config.proof_protocol_allowed_versions = rollout.allowed_protocol_versions
+    hard_auditor = runtime.proof_v3_hard_auditor
+    config.proof_v3_hard_auditor_policy_enabled = hard_auditor.enabled
+    config.proof_v3_hard_auditor_hotkey_ss58 = (
+        hard_auditor.validator_hotkey_ss58
+    )
+    failure_policy = runtime.proof_v3_failure_policy
+    config.proof_v3_failure_epochs_for_penalty = (
+        failure_policy.failure_epochs_for_penalty
+    )
+    config.proof_v3_failure_clean_epochs_for_reset = (
+        failure_policy.clean_hard_audit_epochs_for_reset
+    )
+    config.proof_v3_probation_state_generation = (
+        failure_policy.probation_state_generation
     )
     grace = runtime.maintenance_grace
     config.maintenance_grace_enabled = grace.enabled
@@ -821,6 +1108,57 @@ def maintenance_grace_config_from_neuron_config(config: Any) -> MaintenanceGrace
     )
 
 
+def proof_protocol_rollout_config_from_neuron_config(
+    config: Any,
+) -> ProofProtocolRolloutConfig:
+    raw = getattr(
+        config,
+        "proof_protocol_allowed_versions",
+        DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS,
+    )
+    if isinstance(raw, str):
+        raw = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    return ProofProtocolRolloutConfig(tuple(int(v) for v in raw))
+
+
+def proof_v3_hard_auditor_config_from_neuron_config(
+    config: Any,
+) -> ProofV3HardAuditorConfig:
+    return ProofV3HardAuditorConfig(
+        enabled=bool(
+            getattr(
+                config,
+                "proof_v3_hard_auditor_policy_enabled",
+                False,
+            )
+        ),
+        validator_hotkey_ss58=str(
+            getattr(
+                config,
+                "proof_v3_hard_auditor_hotkey_ss58",
+                "",
+            )
+            or ""
+        ),
+    )
+
+
+def proof_v3_failure_policy_config_from_neuron_config(
+    config: Any,
+) -> ProofV3FailurePolicyConfig:
+    return ProofV3FailurePolicyConfig(
+        failure_epochs_for_penalty=int(
+            getattr(config, "proof_v3_failure_epochs_for_penalty", 1)
+        ),
+        clean_hard_audit_epochs_for_reset=int(
+            getattr(config, "proof_v3_failure_clean_epochs_for_reset", 3)
+        ),
+        probation_state_generation=int(
+            getattr(config, "proof_v3_probation_state_generation", 0)
+        ),
+    )
+
+
 def capacity_audit_config_from_neuron_config(config: Any) -> CapacityAuditRuntimeConfig:
     runtime = CapacityAuditRuntimeConfig(
         enabled=bool(getattr(config, "capacity_audit_enabled", False)),
@@ -861,6 +1199,9 @@ def capacity_audit_config_from_neuron_config(config: Any) -> CapacityAuditRuntim
         ),
         allow_timing_only_score_gate=bool(
             getattr(config, "capacity_audit_allow_timing_only_score_gate", True)
+        ),
+        uid_escalation_enabled=bool(
+            getattr(config, "capacity_audit_uid_escalation_enabled", False)
         ),
         uid_escalation_min_entries=int(
             getattr(config, "capacity_audit_uid_escalation_min_entries", 2)

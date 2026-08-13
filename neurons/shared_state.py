@@ -67,6 +67,11 @@ class ValidatorSharedState:
     # Per-model scores: address -> {model_index (str) -> ema_score}.
     # Prior format (address -> float) is auto-migrated on read.
     miner_scores: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    # Recent validator-observed decode throughput and TTFT per miner/model.
+    # Values are derived from accepted validator-owned receipts; miners never
+    # supply these routing or display signals directly.
+    miner_tps: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    miner_ttft_ms: Dict[str, Dict[str, float]] = field(default_factory=dict)
     # Miners on probation: address -> list of model_indices.
     # Proxy should exclude these from organic traffic routing.
     probation_miners: Dict[str, List[int]] = field(default_factory=dict)
@@ -91,6 +96,15 @@ class ValidatorSharedState:
     # Stale EVM addresses excluded by validator UID ownership checks. Proxy
     # must not route or display these addresses.
     stale_miner_addresses: List[str] = field(default_factory=list)
+    # Owner-signed hard-audit failures, retained independently of miners so
+    # follower validators can consume no-show and invalid-proof outcomes.
+    proof_v3_hard_failures: List[dict] = field(default_factory=list)
+    # Exact canonical bytes of the owner's latest signed verdict snapshot,
+    # hex-encoded for JSON transport. The proxy serves this string verbatim.
+    verdict_snapshot: str = ""
+    # Bounded immutable snapshots keyed by exact epoch. Followers use this
+    # history at close so advancing the latest pointer cannot race their fetch.
+    verdict_snapshots: Dict[str, str] = field(default_factory=dict)
     updated_at: float = 0.0
 
 
@@ -106,6 +120,8 @@ def write_shared_state(
         "epoch_number": state.epoch_number,
         "epoch_start_block": state.epoch_start_block,
         "miner_scores": state.miner_scores,
+        "miner_tps": state.miner_tps,
+        "miner_ttft_ms": state.miner_ttft_ms,
         "probation_miners": state.probation_miners,
         "miner_endpoints": [
             {"address": m.address, "endpoint": m.endpoint,
@@ -131,6 +147,12 @@ def write_shared_state(
         "ss58_map": state.ss58_map,
         "blacklisted_addresses": list(state.blacklisted_addresses),
         "stale_miner_addresses": list(state.stale_miner_addresses),
+        "proof_v3_hard_failures": list(state.proof_v3_hard_failures),
+        "verdict_snapshot": str(state.verdict_snapshot or ""),
+        "verdict_snapshots": {
+            str(epoch): str(snapshot)
+            for epoch, snapshot in state.verdict_snapshots.items()
+        },
         "updated_at": time.time(),
     }
     tmp_path = path + ".tmp"
@@ -186,6 +208,32 @@ def read_shared_state(
             epoch_number=data.get("epoch_number", 0),
             epoch_start_block=data.get("epoch_start_block", 0),
             miner_scores=miner_scores,
+            miner_tps={
+                str(addr).lower(): {
+                    str(index): float(value)
+                    for index, value in values.items()
+                    if float(value) > 0.0
+                }
+                for addr, values in (
+                    data.get("miner_tps", {})
+                    if isinstance(data.get("miner_tps", {}), dict)
+                    else {}
+                ).items()
+                if isinstance(values, dict)
+            },
+            miner_ttft_ms={
+                str(addr).lower(): {
+                    str(index): float(value)
+                    for index, value in values.items()
+                    if float(value) >= 0.0
+                }
+                for addr, values in (
+                    data.get("miner_ttft_ms", {})
+                    if isinstance(data.get("miner_ttft_ms", {}), dict)
+                    else {}
+                ).items()
+                if isinstance(values, dict)
+            },
             probation_miners=data.get("probation_miners", {}),
             miner_endpoints=miner_endpoints,
             audit_drains=audit_drains,
@@ -193,6 +241,29 @@ def read_shared_state(
             ss58_map=data.get("ss58_map", {}),
             blacklisted_addresses=data.get("blacklisted_addresses", []),
             stale_miner_addresses=data.get("stale_miner_addresses", []),
+            proof_v3_hard_failures=[
+                value
+                for value in data.get("proof_v3_hard_failures", [])
+                if isinstance(value, dict)
+            ][:16_384],
+            verdict_snapshot=(
+                str(data.get("verdict_snapshot") or "")
+                if len(str(data.get("verdict_snapshot") or ""))
+                <= 64 * 1024 * 1024
+                else ""
+            ),
+            verdict_snapshots={
+                str(epoch): str(snapshot)
+                for epoch, snapshot in (
+                    data.get("verdict_snapshots", {})
+                    if isinstance(data.get("verdict_snapshots", {}), dict)
+                    else {}
+                ).items()
+                if (
+                    str(epoch).isdigit()
+                    and len(str(snapshot)) <= 64 * 1024 * 1024
+                )
+            },
             updated_at=data.get("updated_at", 0.0),
         )
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):

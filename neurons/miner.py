@@ -29,12 +29,14 @@ import argparse
 import json
 import logging
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import bittensor as bt
 import httpx
@@ -46,6 +48,10 @@ from neurons.model_resolve import (
     resolve_model_config,
     validate_capacity_recommended_model,
 )
+from neurons.subnet_runtime_config import (
+    RuntimeSubnetConfigClient,
+    apply_runtime_config_to_neuron_config,
+)
 from neurons.version import spec_version, version_str, miner_version, miner_version_str
 from verallm.chain.config import ChainConfig
 from verallm.chain.miner_registry import MinerRegistryClient
@@ -53,6 +59,419 @@ from verallm.chain.provider import Web3Provider
 from verallm.chain.wallet import derive_evm_private_key, derive_evm_address
 
 logger = logging.getLogger(__name__)
+
+
+PROOF_V2_MANIFEST_ENV = "VERATHOS_PROOF_V2_MANIFEST"
+PROOF_V2_WEIGHT_CATALOG_ENV = "VERATHOS_PROOF_V2_WEIGHT_CATALOG"
+PROOF_V2_ARTIFACT_BASE_URLS_ENV = "VERATHOS_PROOF_V2_ARTIFACT_BASE_URLS"
+PROOF_V2_ARTIFACT_CACHE_DIR_ENV = "VERATHOS_PROOF_V2_ARTIFACT_CACHE_DIR"
+PROOF_V3_MANIFEST_ENV = "VERATHOS_PROOF_V3_MANIFEST"
+PROOF_V3_EXECUTION_PROFILE_ENV = "VERATHOS_PROOF_V3_EXECUTION_PROFILE"
+PROOF_V3_CALIBRATION_SET_ENV = "VERATHOS_PROOF_V3_CALIBRATION_SET"
+PROOF_V3_ATTENTION_SEMANTICS_ENV = "VERATHOS_PROOF_V3_ATTENTION_SEMANTICS"
+PROOF_V3_GDN_SEMANTICS_ENV = "VERATHOS_PROOF_V3_GDN_SEMANTICS"
+PROOF_V3_LM_HEAD_CATALOG_ENV = "VERATHOS_PROOF_V3_LM_HEAD_CATALOG"
+PROOF_V3_PROJECTION_MANIFEST_ENV = "VERATHOS_PROOF_V3_PROJECTION_MANIFEST"
+PROOF_V3_PROJECTION_CATALOG_ENV = "VERATHOS_PROOF_V3_PROJECTION_CATALOG"
+PROOF_V3_RUNTIME_ENCODING_ENV = "VERATHOS_PROOF_V3_RUNTIME_ENCODING"
+PROOF_V3_WEIGHT_CACHE_DIR_ENV = "VERATHOS_PROOF_V3_WEIGHT_CACHE_DIR"
+PROOF_V3_RELEASE_ENV = "VERATHOS_PROOF_V3_RELEASE"
+
+_PROOF_SAFE_FP8_BACKEND_ENV = (
+    "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER",
+    "VLLM_USE_DEEP_GEMM",
+)
+
+PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS = 60.0
+PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS = 5.0
+
+_MANAGED_NGINX_CONFIG_PATHS = (
+    Path("/etc/nginx/sites-available/verathos-miner"),
+    Path("/etc/nginx/sites-enabled/verathos-miner"),
+    Path("/etc/nginx/nginx.conf"),
+)
+_MANAGED_NGINX_OLD_READ_TIMEOUTS = (
+    "proxy_read_timeout 120s;",
+    "proxy_read_timeout 360s;",
+)
+_MANAGED_NGINX_READ_TIMEOUT = "proxy_read_timeout 540s;"
+
+
+def _reconcile_managed_nginx_read_timeout(
+    *,
+    config_paths: tuple[Path, ...] = _MANAGED_NGINX_CONFIG_PATHS,
+    run_command: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    effective_uid: int | None = None,
+) -> bool:
+    """Align the stock HTTPS proxy with the signed hard-proof deadline.
+
+    The authenticated hard-proof response budget reaches 480 seconds for the
+    largest qualified decode geometry. Older stock templates used 120 or 360
+    seconds and could terminate a valid proof before the validator deadline.
+    Only byte-recognizable Verathos-managed server blocks are migrated; custom
+    reverse-proxy configurations are never rewritten.
+    """
+
+    managed_marker = "ssl_certificate /etc/nginx/ssl/miner.crt;"
+    backend_marker = "proxy_pass http://127.0.0.1:"
+    selected_uid = os.geteuid() if effective_uid is None else effective_uid
+    use_sudo = selected_uid != 0
+    changed: list[tuple[Path, str, int]] = []
+    seen: set[Path] = set()
+
+    def _install_text(path: Path, content: str, mode: int) -> bool:
+        if not use_sudo:
+            temporary = path.with_name(f".{path.name}.verathos-timeout.tmp")
+            try:
+                temporary.write_text(content)
+                temporary.chmod(mode)
+                os.replace(temporary, path)
+                return True
+            except OSError:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
+
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="verathos-nginx-timeout-",
+                delete=False,
+            ) as temporary:
+                temporary.write(content)
+                temporary_name = temporary.name
+            installed = run_command(
+                [
+                    "sudo",
+                    "-n",
+                    "install",
+                    "-m",
+                    f"{mode:o}",
+                    "--",
+                    temporary_name,
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return installed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        finally:
+            if temporary_name is not None:
+                try:
+                    Path(temporary_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    for candidate in config_paths:
+        try:
+            path = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            original = path.read_text()
+        except (OSError, UnicodeError):
+            continue
+        if _MANAGED_NGINX_READ_TIMEOUT in original:
+            continue
+        old_timeouts = tuple(
+            value
+            for value in _MANAGED_NGINX_OLD_READ_TIMEOUTS
+            if value in original
+        )
+        if not old_timeouts:
+            continue
+        if managed_marker not in original or backend_marker not in original:
+            bt.logging.warning(
+                f"Custom nginx config {path} retains an old read timeout; "
+                "set the proof-v3 upstream timeout to at least 540s"
+            )
+            continue
+        old_count = original.count(old_timeouts[0]) if len(old_timeouts) == 1 else 0
+        current_count = original.count(_MANAGED_NGINX_READ_TIMEOUT)
+        managed_count = original.count(managed_marker)
+        backend_count = original.count(backend_marker)
+        if (
+            len(old_timeouts) != 1
+            or old_count < 1
+            or managed_count != backend_count
+            or managed_count != old_count + current_count
+        ):
+            bt.logging.warning(
+                f"Managed nginx config {path} has an ambiguous read timeout; "
+                "set the proof-v3 upstream timeout to at least 540s"
+            )
+            continue
+        updated = original.replace(
+            old_timeouts[0],
+            _MANAGED_NGINX_READ_TIMEOUT,
+        )
+        try:
+            mode = path.stat().st_mode & 0o7777
+        except OSError as exc:
+            bt.logging.warning(
+                f"Could not inspect managed nginx config {path}: {exc}; "
+                "set it to at least 360s manually"
+            )
+            continue
+        if not _install_text(path, updated, mode):
+            bt.logging.warning(
+                f"Could not update managed nginx timeout in {path}; "
+                "passwordless sudo is required for a non-root official install"
+            )
+            continue
+        changed.append((path, original, mode))
+
+    if not changed:
+        return True
+
+    def _run_nginx(*args: str) -> subprocess.CompletedProcess:
+        prefix = ["sudo", "-n"] if use_sudo else []
+        return run_command(
+            [*prefix, "nginx", *args],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    try:
+        checked = _run_nginx("-t")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        checked = subprocess.CompletedProcess(
+            ["nginx", "-t"], 1, "", str(exc)
+        )
+    if checked.returncode != 0:
+        rollback_results = [
+            _install_text(path, original, mode)
+            for path, original, mode in changed
+        ]
+        rollback_ok = all(rollback_results)
+        bt.logging.warning(
+            "Managed nginx timeout migration failed validation and was rolled "
+            f"back{'' if rollback_ok else ' incompletely'}: "
+            f"{(checked.stderr or checked.stdout).strip()}"
+        )
+        return False
+
+    try:
+        reloaded = _run_nginx("-s", "reload")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        reloaded = subprocess.CompletedProcess(
+            ["nginx", "-s", "reload"], 1, "", str(exc)
+        )
+    if reloaded.returncode != 0:
+        bt.logging.warning(
+            "Managed nginx timeout was updated but nginx reload failed: "
+            f"{(reloaded.stderr or reloaded.stdout).strip()}"
+        )
+        return False
+
+    bt.logging.info(
+        "Updated the managed nginx upstream read timeout to 540s for "
+        "proof-v3 hard responses"
+    )
+    return True
+
+
+def _configured_miner_proof_protocol_versions(
+    owner_allowed: tuple[int, ...],
+    *,
+    proof_v3_configured: bool,
+) -> tuple[int, ...]:
+    """Intersect owner policy with the proof stack this miner will serve.
+
+    Validators support both rollout generations.  A miner with an
+    authenticated v3 release serves v3 only; a legacy-configured miner serves
+    v1 only.  This keeps ``[1, 3]`` an owner compatibility allowlist without
+    forcing updated compressed checkpoints to construct an unused legacy-v1
+    weight tree.
+    """
+
+    locally_served = {3} if proof_v3_configured else {1}
+    return tuple(
+        version
+        for version in sorted(set(int(v) for v in owner_allowed))
+        if version in locally_served
+    )
+
+
+class ProofV3ArtifactRefreshWatcher:
+    """Detect and adopt authenticated remote proof-v3 release changes.
+
+    A cheap chain-context-checked index probe runs on the steady-state path.
+    A candidate change is fully downloaded and authenticated before a restart
+    is scheduled. Live inference, hard proofs, and capacity audits are never
+    interrupted; the authenticated update remains pending until the endpoint
+    reaches an idle adoption window.
+    """
+
+    def __init__(
+        self,
+        *,
+        current_release_sha256: bytes,
+        probe_release: Callable[[], object],
+        resolve_release: Callable[[], object],
+        busy_state: Callable[[], tuple[int, int, bool, bool]],
+        restart: Callable[[], None],
+        interval_seconds: float = PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS,
+        retry_seconds: float = PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS,
+    ) -> None:
+        if (
+            type(current_release_sha256) is not bytes
+            or len(current_release_sha256) != 32
+        ):
+            raise ValueError("current proof-v3 release digest is invalid")
+        if not all(
+            callable(value)
+            for value in (probe_release, resolve_release, busy_state, restart)
+        ):
+            raise ValueError("proof-v3 artifact refresh callbacks are invalid")
+        if min(interval_seconds, retry_seconds) <= 0:
+            raise ValueError("proof-v3 artifact refresh timing is invalid")
+        self.current_release_sha256 = current_release_sha256
+        self.probe_release = probe_release
+        self.resolve_release = resolve_release
+        self.busy_state = busy_state
+        self.restart = restart
+        self.interval_seconds = float(interval_seconds)
+        self.retry_seconds = float(retry_seconds)
+        self._pending_release_sha256: bytes | None = None
+        self._pending_since: float | None = None
+        self._restart_triggered = False
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def check_once(self, *, now: float | None = None) -> str:
+        """Run one deterministic refresh/adoption decision."""
+
+        if self._stop_event.is_set():
+            return "stopped"
+        if self._restart_triggered:
+            return "restart_triggered"
+        selected_now = time.monotonic() if now is None else float(now)
+        if self._pending_release_sha256 is None:
+            probe = self.probe_release()
+            candidate = getattr(probe, "release_sha256", None)
+            if type(candidate) is not bytes or len(candidate) != 32:
+                raise RuntimeError("proof-v3 release probe digest is invalid")
+            if candidate == self.current_release_sha256:
+                return "unchanged"
+            resolved = self.resolve_release()
+            resolved_digest = getattr(resolved, "release_sha256", None)
+            if type(resolved_digest) is not bytes or len(resolved_digest) != 32:
+                raise RuntimeError(
+                    "authenticated proof-v3 release digest is invalid"
+                )
+            if resolved_digest != candidate:
+                raise RuntimeError(
+                    "authenticated proof-v3 release does not match the probed index"
+                )
+            self._pending_release_sha256 = resolved_digest
+            self._pending_since = selected_now
+            bt.logging.warning(
+                "Authenticated proof-v3 artifact update detected: "
+                f"{self.current_release_sha256.hex()[:16]}... -> "
+                f"{resolved_digest.hex()[:16]}...; waiting for an idle "
+                "adoption window"
+            )
+
+        active_requests, proof_pending, hard_exclusive, capacity_active = (
+            self.busy_state()
+        )
+        if proof_pending > 0 or hard_exclusive or capacity_active:
+            return "deferred_proof_or_audit"
+        if active_requests > 0:
+            return "deferred_active_requests"
+        if self._stop_event.is_set():
+            return "stopped"
+
+        self._restart_triggered = True
+        bt.logging.info(
+            "Proof-v3 artifact adoption window is idle; restarting onto "
+            "the authenticated release"
+        )
+        try:
+            self.restart()
+        except BaseException:
+            # A failed restart attempt must remain retryable.  The production
+            # restart helper normally does not return, but this also covers a
+            # PM2/exec failure without pinning the watcher in a false-success
+            # state.
+            self._restart_triggered = False
+            raise
+        return "restart_triggered"
+
+    def _run(self) -> None:
+        if self._stop_event.wait(self.interval_seconds):
+            return
+        while not self._stop_event.is_set():
+            delay = self.interval_seconds
+            try:
+                result = self.check_once()
+                if result.startswith("deferred_"):
+                    delay = self.retry_seconds
+            except Exception as exc:
+                bt.logging.warning(
+                    f"Proof-v3 artifact refresh rejected; keeping current release: {exc}"
+                )
+            if self._stop_event.wait(delay):
+                return
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="proof-v3-artifact-refresh",
+        )
+        self._thread.start()
+        bt.logging.info(
+            "Proof-v3 artifact refresh started "
+            f"(interval={self.interval_seconds:.0f}s)"
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
+def _proof_v3_hard_auditor_record(
+    runtime,
+    validator_hotkeys: set[str],
+) -> dict[str, object]:
+    """Build the sole hard-auditor record forwarded to the server process."""
+
+    disabled: dict[str, object] = {
+        "enabled": False,
+        "validator_hotkey_ss58": "",
+        "config_version": 0,
+        "effective_epoch": None,
+    }
+    if runtime is None:
+        return disabled
+    policy = runtime.proof_v3_hard_auditor
+    hotkey = str(policy.validator_hotkey_ss58 or "")
+    if not policy.enabled or hotkey not in validator_hotkeys:
+        return {
+            **disabled,
+            "config_version": int(runtime.version),
+            "effective_epoch": runtime.effective_epoch,
+        }
+    return {
+        "enabled": True,
+        "validator_hotkey_ss58": hotkey,
+        "config_version": int(runtime.version),
+        "effective_epoch": runtime.effective_epoch,
+    }
 
 
 def _capacity_audit_worker_poll_interval(config) -> float:
@@ -89,6 +508,119 @@ def _set_server_arg(server_args: list[str], flag: str, value: str) -> list[str]:
         out.append(arg)
     out.extend([flag, value])
     return out
+
+
+def _forward_proof_v2_artifacts(
+    server_args: list[str],
+    *,
+    manifest: str | None,
+    weight_catalog: str | None,
+    artifact_base_urls: list[str] | None = None,
+    artifact_cache_dir: str | None = None,
+) -> list[str]:
+    """Forward configured proof-v2 artifacts to the inner miner server.
+
+    Arguments supplied directly to the inner server after ``--`` take
+    precedence over wrapper environment defaults.
+    """
+    out = list(server_args)
+    for flag, value in (
+        ("--proof-v2-manifest", manifest),
+        ("--proof-v2-weight-catalog", weight_catalog),
+        ("--proof-v2-artifact-cache-dir", artifact_cache_dir),
+    ):
+        if value and flag not in out:
+            out.extend([flag, value])
+    if (
+        artifact_base_urls
+        and "--proof-v2-artifact-base-url" not in out
+    ):
+        for value in artifact_base_urls:
+            if value:
+                out.extend(["--proof-v2-artifact-base-url", value])
+    return out
+
+
+def _forward_proof_v3_artifacts(
+    server_args: list[str],
+    *,
+    manifest: str | None,
+    execution_profile: str | None,
+    calibration_set: str | None,
+    attention_semantics: str | None,
+    gdn_semantics: str | None,
+    lm_head_catalog: str | None,
+    projection_manifest: str | None,
+    projection_catalog: str | None,
+    runtime_encoding: str | None,
+    weight_cache_dir: str | None,
+) -> list[str]:
+    """Forward one explicit authenticated proof-v3 release."""
+
+    out = list(server_args)
+    for flag, value in (
+        ("--proof-v3-manifest", manifest),
+        ("--proof-v3-execution-profile", execution_profile),
+        ("--proof-v3-calibration-set", calibration_set),
+        ("--proof-v3-attention-semantics", attention_semantics),
+        ("--proof-v3-gdn-semantics", gdn_semantics),
+        ("--proof-v3-lm-head-catalog", lm_head_catalog),
+        ("--proof-v3-projection-manifest", projection_manifest),
+        ("--proof-v3-projection-catalog", projection_catalog),
+        ("--proof-v3-runtime-encoding", runtime_encoding),
+        ("--proof-v3-weight-cache-dir", weight_cache_dir),
+    ):
+        if value and flag not in out:
+            out.extend([flag, value])
+    return out
+
+
+def _apply_proof_v3_release_descriptor(args, descriptor_path: str) -> None:
+    """Expand one authenticated release descriptor into server arguments."""
+
+    from verallm.proof_v3.economic_release_catalog import (
+        load_proof_v3_release_descriptor,
+        proof_v3_release_artifact_paths,
+    )
+
+    source, value = load_proof_v3_release_descriptor(descriptor_path)
+    _source, paths = proof_v3_release_artifact_paths(source)
+    attributes = {
+        "proof_v3_manifest": "manifest",
+        "proof_v3_execution_profile": "execution_profile",
+        "proof_v3_calibration_set": "calibration_set",
+        "proof_v3_attention_semantics": "attention_runtime_semantics",
+        "proof_v3_gdn_semantics": "gdn_runtime_semantics",
+        "proof_v3_lm_head_catalog": "lm_head_catalog",
+        "proof_v3_projection_manifest": "projection_manifest",
+        "proof_v3_projection_catalog": "projection_catalog",
+    }
+    explicitly_configured = tuple(
+        name
+        for name in attributes
+        if str(getattr(args, name, None) or "").strip()
+    )
+    if explicitly_configured:
+        raise RuntimeError(
+            "proof-v3 release descriptor conflicts with explicit artifact "
+            "paths: " + ", ".join(explicitly_configured)
+        )
+    for attribute, role in attributes.items():
+        setattr(
+            args,
+            attribute,
+            str(paths[role]) if role in paths else None,
+        )
+    existing_encoding = str(
+        getattr(args, "proof_v3_runtime_encoding", None) or ""
+    ).strip()
+    descriptor_encoding = str(value["runtime_encoding_id"])
+    if existing_encoding and existing_encoding != descriptor_encoding:
+        raise RuntimeError(
+            "proof-v3 release descriptor conflicts with the configured "
+            "runtime encoding"
+        )
+    args.proof_v3_runtime_encoding = descriptor_encoding
 
 
 def _capacity_audit_state_path(evm_address: str | None, port: int) -> str:
@@ -253,10 +785,19 @@ class MinerNeuron:
         self._miner_client: Optional[MinerRegistryClient] = None
         self._server_process: Optional[subprocess.Popen] = None
         self._capacity_audit_worker = None
+        self._proof_v3_artifact_watcher: Optional[
+            ProofV3ArtifactRefreshWatcher
+        ] = None
+        self._subnet_runtime_config_client = (
+            RuntimeSubnetConfigClient.from_config(config, log=bt.logging)
+        )
+        self._proof_v3_configured = False
+        self._served_proof_protocol_versions: tuple[int, ...] = ()
         self._running = True
 
         self.evm_pk = ""
         self.evm_addr = ""
+        self.hotkey_ss58 = ""
         self.uid: Optional[int] = None  # resolved from metagraph during setup()
 
     def setup(self, private_key: Optional[str] = None):
@@ -287,6 +828,7 @@ class MinerNeuron:
                 self.config.wallet_name, self.config.hotkey_name, wallet,
             )
             self.hotkey_seed = hotkey_seed
+            self.hotkey_ss58 = wallet.hotkey.ss58_address
 
             self.evm_pk = derive_evm_private_key(hotkey_seed)
             self.evm_addr = derive_evm_address(hotkey_seed)
@@ -488,8 +1030,9 @@ class MinerNeuron:
 
         Auto-handles the Mamba/GDN max_num_seqs auto-tune: if the first
         launch exits with code 42 and leaves a hint file, we re-spawn the
-        subprocess with --max-num-seqs N where N is the available Mamba
-        cache-block count vLLM reported.  See _MAMBA_HINT_PATH above.
+        subprocess with a hardware-bounded --max-num-seqs N derived from the
+        available Mamba cache-block count vLLM reported. See
+        _MAMBA_HINT_PATH above.
         This makes Qwen3.5 / Qwen3.6 / any future Mamba-hybrid model start
         out-of-the-box on any GPU size without operator intervention.
         """
@@ -676,6 +1219,106 @@ class MinerNeuron:
         except Exception as e:
             bt.logging.warning(f"Could not query server for actual context: {e}")
             return None
+
+    def _proof_v3_refresh_busy_state(
+        self,
+        endpoint: str,
+    ) -> tuple[int, int, bool, bool]:
+        """Return bounded local work state for authenticated release adoption."""
+
+        capacity_active = False
+        worker = self._capacity_audit_worker
+        if worker is not None:
+            try:
+                capacity_active = bool(worker._has_active_local_audit())
+            except Exception:
+                # An unreadable audit state must delay, never authorize, a
+                # restart that could destroy an active capacity witness.
+                capacity_active = True
+        proc = self._server_process
+        if proc is None or proc.poll() is not None:
+            return 0, 0, False, capacity_active
+        try:
+            response = httpx.get(f"{endpoint}/health", timeout=5.0)
+            response.raise_for_status()
+            health = response.json()
+            active_requests = max(0, int(health.get("active_requests", 0)))
+            proof_pending = max(0, int(health.get("proof_pending", 0)))
+            hard_exclusive = bool(health.get("hard_proof_exclusive", False))
+            return (
+                active_requests,
+                proof_pending,
+                hard_exclusive,
+                capacity_active,
+            )
+        except Exception:
+            # A live but unreadable server is treated as busy. Validators
+            # independently enforce the authenticated release, so update
+            # adoption never needs to destroy an honest in-flight request.
+            return 1, 0, False, capacity_active
+
+    def _auto_update_busy(self, endpoint: str) -> bool:
+        """Never restart through live inference, proof, or capacity work."""
+
+        active, proof_pending, hard_exclusive, capacity_active = (
+            self._proof_v3_refresh_busy_state(endpoint)
+        )
+        return bool(
+            active > 0
+            or proof_pending > 0
+            or hard_exclusive
+            or capacity_active
+        )
+
+    def start_proof_v3_artifact_refresh(
+        self,
+        *,
+        model_id: str,
+        base_urls: tuple[str, ...],
+        chain_config,
+        model_registry_client,
+        cache_directory: str | None,
+        current_release_sha256: bytes,
+        local_health_url: str,
+    ) -> None:
+        """Watch one remote release and restart onto authenticated changes."""
+
+        if self._proof_v3_artifact_watcher is not None:
+            return
+        from neurons.auto_update import restart_process
+        from verallm.proof_v3.artifact_store import (
+            probe_remote_proof_v3_release,
+            resolve_remote_proof_v3_release,
+        )
+
+        def _probe():
+            return probe_remote_proof_v3_release(
+                model_id,
+                base_urls,
+                chain_config=chain_config,
+                cache_directory=cache_directory,
+            )
+
+        def _resolve():
+            return resolve_remote_proof_v3_release(
+                model_id,
+                base_urls,
+                chain_config=chain_config,
+                model_registry_client=model_registry_client,
+                cache_directory=cache_directory,
+            )
+
+        watcher = ProofV3ArtifactRefreshWatcher(
+            current_release_sha256=current_release_sha256,
+            probe_release=_probe,
+            resolve_release=_resolve,
+            busy_state=lambda: self._proof_v3_refresh_busy_state(
+                local_health_url
+            ),
+            restart=restart_process,
+        )
+        self._proof_v3_artifact_watcher = watcher
+        watcher.start()
 
     @staticmethod
     def _ctx_close_enough(old: int, new: int, tolerance: float = 0.10) -> bool:
@@ -995,7 +1638,7 @@ class MinerNeuron:
         Validators must have a permit AND meet the on-chain minValidatorStake
         threshold (read from ValidatorRegistry every refresh cycle).
         """
-        from verallm.api.validator_auth import DEFAULT_VALIDATORS_PATH
+        from verallm.api.validator_auth import resolve_validators_path
         try:
             sub = self._get_subtensor()
             metagraph = sub.metagraph(netuid=self.config.netuid)
@@ -1030,6 +1673,46 @@ class MinerNeuron:
                         "stake": stake,
                     })
 
+            validator_hotkeys = {
+                str(row["hotkey_ss58"])
+                for row in validators
+                if row.get("hotkey_ss58")
+            }
+            hard_auditor = _proof_v3_hard_auditor_record(
+                None,
+                validator_hotkeys,
+            )
+            try:
+                block_value = getattr(metagraph, "block", 0)
+                if hasattr(block_value, "item"):
+                    block_value = block_value.item()
+                block_number = int(block_value or 0)
+                epoch_blocks = max(1, int(self.config.epoch_blocks))
+                current_epoch = (
+                    block_number // epoch_blocks if block_number > 0 else None
+                )
+                runtime = self._subnet_runtime_config_client.get(
+                    current_epoch=current_epoch,
+                    force=False,
+                )
+                hard_auditor = _proof_v3_hard_auditor_record(
+                    runtime,
+                    validator_hotkeys,
+                )
+                if runtime is not None:
+                    apply_runtime_config_to_neuron_config(runtime, self.config)
+                    policy = runtime.proof_v3_hard_auditor
+                    if policy.enabled and not hard_auditor["enabled"]:
+                        bt.logging.warning(
+                            "Configured proof-v3 hard auditor is not in the "
+                            "current validator allowlist; hard reveals remain disabled"
+                        )
+            except Exception as exc:
+                bt.logging.warning(
+                    "Could not refresh proof-v3 hard-auditor policy; "
+                    f"hard reveals remain disabled: {exc}"
+                )
+
             # Inject manually allowed validators (--allow-validators)
             allow_extra = getattr(self.config, "allow_validators", None) or []
             existing_ss58 = {v["hotkey_ss58"] for v in validators}
@@ -1038,12 +1721,24 @@ class MinerNeuron:
                     validators.append({"uid": -1, "hotkey_ss58": ss58, "stake": 0})
                     bt.logging.info(f"Manually allowed validator: {ss58}")
 
-            out_path = os.environ.get("VERATHOS_VALIDATORS_PATH", DEFAULT_VALIDATORS_PATH)
+            out_path_obj = resolve_validators_path()
+            out_path_obj.parent.mkdir(parents=True, exist_ok=True)
+            out_path = str(out_path_obj)
             data = {
                 "updated_at": int(time.time()),
                 "netuid": self.config.netuid,
                 "validators": validators,
+                "proof_v3_hard_auditor": hard_auditor,
+                "allowed_proof_protocol_versions": list(
+                    _configured_miner_proof_protocol_versions(
+                        self.config.proof_protocol_allowed_versions,
+                        proof_v3_configured=self._proof_v3_configured,
+                    )
+                ),
             }
+            self._served_proof_protocol_versions = tuple(
+                data["allowed_proof_protocol_versions"]
+            )
             # Atomic write: write to temp file then rename
             tmp_path = out_path + ".tmp"
             with open(tmp_path, "w") as f:
@@ -1225,6 +1920,9 @@ class MinerNeuron:
     def shutdown(self):
         """Clean shutdown."""
         self._running = False
+        artifact_watcher = getattr(self, "_proof_v3_artifact_watcher", None)
+        if artifact_watcher is not None:
+            artifact_watcher.stop()
         if self._capacity_audit_worker is not None:
             self._capacity_audit_worker.stop()
         proc = self._server_process
@@ -1252,9 +1950,9 @@ def parse_args():
     parser.add_argument("--chain-config", default=None,
                         help="Path to chain config JSON. If omitted, derived from --subtensor-network.")
     parser.add_argument("--subtensor-network", default=None,
-                        help="Bittensor network name (test or finney). Selects chain config (contracts) and default RPC URL.")
+                        help="Bittensor network name (test or finney). Selects chain config and default RPC URL.")
     parser.add_argument("--subtensor-chain-endpoint", default=None,
-                        help="Explicit Substrate+EVM RPC endpoint (e.g. http://localhost:9944 for local subtensor).")
+                        help="Explicit Substrate+EVM endpoint. Public RPCs are not recommended for stable mining.")
     parser.add_argument("--endpoint", required=True, help="Public miner endpoint URL")
     parser.add_argument("--skip-external-port-check", action="store_true",
                         help="Skip the public endpoint reachability preflight. "
@@ -1303,6 +2001,144 @@ def parse_args():
     parser.add_argument("--capacity-audit-worker-poll-s", type=float, default=None,
                         help="Miner-side capacity-audit chain polling interval in seconds.")
 
+    proof_v2_group = parser.add_argument_group("proof v2")
+    proof_v2_group.add_argument(
+        "--proof-v2-manifest",
+        default=os.environ.get(PROOF_V2_MANIFEST_ENV),
+        help=(
+            "Path to the chain-authenticated proof-v2 manifest document "
+            f"(env: {PROOF_V2_MANIFEST_ENV})."
+        ),
+    )
+    proof_v2_group.add_argument(
+        "--proof-v2-weight-catalog",
+        default=os.environ.get(PROOF_V2_WEIGHT_CATALOG_ENV),
+        help=(
+            "Path to the static proof-v2 weight commitment catalog "
+            f"(env: {PROOF_V2_WEIGHT_CATALOG_ENV})."
+        ),
+    )
+    proof_v2_group.add_argument(
+        "--proof-v2-artifact-base-url",
+        action="append",
+        default=None,
+        help=(
+            "HTTPS base URL for a content-addressed proof-v2 artifact store. "
+            "Repeat to configure fallback mirrors "
+            f"(env: {PROOF_V2_ARTIFACT_BASE_URLS_ENV}, comma-separated)."
+        ),
+    )
+    proof_v2_group.add_argument(
+        "--proof-v2-artifact-cache-dir",
+        default=os.environ.get(PROOF_V2_ARTIFACT_CACHE_DIR_ENV),
+        help=(
+            "Local cache directory for downloaded proof-v2 artifacts "
+            f"(env: {PROOF_V2_ARTIFACT_CACHE_DIR_ENV})."
+        ),
+    )
+
+    proof_v3_group = parser.add_argument_group("proof v3")
+    proof_v3_group.add_argument(
+        "--proof-v3-release",
+        default=os.environ.get(PROOF_V3_RELEASE_ENV),
+        help=(
+            "Complete local proof-v3 release descriptor "
+            f"(env: {PROOF_V3_RELEASE_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-artifact-base-url",
+        action="append",
+        default=None,
+        help=(
+            "HTTPS base URL for content-addressed proof-v3 releases. "
+            "Repeat for mirrors; defaults to "
+            "VERATHOS_PROOF_V3_ARTIFACT_BASE_URLS."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-artifact-cache-dir",
+        default=None,
+        help=(
+            "Local content-addressed proof-v3 release cache; defaults to "
+            "VERATHOS_PROOF_V3_ARTIFACT_CACHE_DIR or VERALLM_DATA_DIR."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-manifest",
+        default=os.environ.get(PROOF_V3_MANIFEST_ENV),
+        help=f"Authority-signed projection manifest (env: {PROOF_V3_MANIFEST_ENV}).",
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-execution-profile",
+        default=os.environ.get(PROOF_V3_EXECUTION_PROFILE_ENV),
+        help=(
+            "Authority-signed execution profile "
+            f"(env: {PROOF_V3_EXECUTION_PROFILE_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-calibration-set",
+        default=os.environ.get(PROOF_V3_CALIBRATION_SET_ENV),
+        help=f"Manifest-bound calibration set (env: {PROOF_V3_CALIBRATION_SET_ENV}).",
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-attention-semantics",
+        default=os.environ.get(PROOF_V3_ATTENTION_SEMANTICS_ENV),
+        help=(
+            "Manifest-bound attention runtime semantics "
+            f"(env: {PROOF_V3_ATTENTION_SEMANTICS_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-gdn-semantics",
+        default=os.environ.get(PROOF_V3_GDN_SEMANTICS_ENV),
+        help=(
+            "Manifest-bound GDN runtime semantics when required "
+            f"(env: {PROOF_V3_GDN_SEMANTICS_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-lm-head-catalog",
+        default=os.environ.get(PROOF_V3_LM_HEAD_CATALOG_ENV),
+        help=(
+            "Manifest-bound LM-head commitment catalog "
+            f"(env: {PROOF_V3_LM_HEAD_CATALOG_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-projection-manifest",
+        default=os.environ.get(PROOF_V3_PROJECTION_MANIFEST_ENV),
+        help=(
+            "Authority-signed projection catalog manifest "
+            f"(env: {PROOF_V3_PROJECTION_MANIFEST_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-projection-catalog",
+        default=os.environ.get(PROOF_V3_PROJECTION_CATALOG_ENV),
+        help=(
+            "Manifest-bound projection catalog "
+            f"(env: {PROOF_V3_PROJECTION_CATALOG_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-runtime-encoding",
+        default=os.environ.get(PROOF_V3_RUNTIME_ENCODING_ENV),
+        help=(
+            "Qualified activation encoding ID "
+            f"(env: {PROOF_V3_RUNTIME_ENCODING_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-weight-cache-dir",
+        default=os.environ.get(PROOF_V3_WEIGHT_CACHE_DIR_ENV),
+        help=(
+            "Persistent authenticated static-weight cache "
+            f"(env: {PROOF_V3_WEIGHT_CACHE_DIR_ENV})."
+        ),
+    )
+
     # TEE (Trusted Execution Environment)
     tee_group = parser.add_argument_group("tee")
     parser.add_argument("--allow-validators", nargs="+", default=None,
@@ -1336,6 +2172,53 @@ def parse_args():
     # Everything after -- is passed to the miner server
     args, server_args = parser.parse_known_args()
     return args, _normalize_server_args(server_args)
+
+
+def _neuron_config_from_args(args) -> NeuronConfig:
+    """Construct network-scoped miner config from parsed CLI arguments."""
+
+    overrides = {
+        "wallet_name": args.wallet or "default",
+        "hotkey_name": args.hotkey,
+        "netuid": args.netuid,
+    }
+    if args.subtensor_network:
+        # Bind network-scoped runtime URLs at construction time. Mutating
+        # ``subtensor_network`` afterward leaves the default subnet-config and
+        # owner-verdict URLs on their previous network.
+        overrides["subtensor_network"] = args.subtensor_network
+    return NeuronConfig.from_env(**overrides)
+
+
+def _configure_proof_safe_fp8_backend(quant: str) -> tuple[str, ...]:
+    """Install the canonical vLLM FP8 backend defaults before server spawn.
+
+    The setup installer persists these values in ``.env.sh``, but a miner
+    started directly (or a newly added PM2 sibling) must not depend on an
+    interactive shell having sourced that file.  Explicit incompatible
+    overrides fail before model loading instead of selecting an unqualified
+    backend later in vLLM startup.
+    """
+
+    normalized = str(quant or "").strip().lower().replace("-", "_")
+    if not normalized.startswith("fp8"):
+        return ()
+
+    defaulted: list[str] = []
+    for name in _PROOF_SAFE_FP8_BACKEND_ENV:
+        value = os.environ.get(name)
+        if value is None or not value.strip():
+            os.environ[name] = "0"
+            defaulted.append(name)
+            continue
+        if value.strip() != "0":
+            raise RuntimeError(
+                f"FP8 proof serving requires {name}=0, got {value!r}. "
+                "Remove the override or rerun scripts/setup_miner.sh before "
+                "starting the miner; refusing an unqualified vLLM backend "
+                "before model load."
+            )
+    return tuple(defaulted)
 
 
 def _extract_code_measurement(platform: str, attestation_report: bytes, Web3) -> bytes:
@@ -1452,33 +2335,135 @@ def _extract_server_port(server_args: list[str]) -> int:
     return 8000  # matches verallm.api.server default
 
 
-def _clear_stale_compile_caches() -> None:
-    """Clear torch.compile / Triton caches to prevent stale kernels.
+def _compile_cache_dirs(
+    *,
+    environ=None,
+    home=None,
+    tmp_root=None,
+) -> tuple:
+    """Return the exact compile-cache directories owned by this miner."""
 
-    Stale caches from previous code versions can cause CUDA illegal memory
-    access crashes or silent proof performance regressions.  Clearing on
-    every startup is safe — recompilation adds ~30s to first startup only.
-    """
-    import shutil
     import pathlib
-    home = pathlib.Path.home()
+
+    environ = os.environ if environ is None else environ
+    home = pathlib.Path.home() if home is None else pathlib.Path(home)
+    tmp_root = pathlib.Path("/tmp") if tmp_root is None else pathlib.Path(tmp_root)
     cache_dirs = [
         home / ".cache" / "vllm" / "torch_compile_cache",
         home / ".triton" / "cache",
     ]
-    # /tmp/torchinductor_<user> — match any user
-    for p in pathlib.Path("/tmp").glob("torchinductor_*"):
-        cache_dirs.append(p)
+    for name in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"):
+        value = str(environ.get(name, "")).strip()
+        if value:
+            cache_dirs.append(pathlib.Path(value).expanduser())
+    cache_dirs.extend(tmp_root.glob("torchinductor_*"))
+    # Keep ordering stable for logs/tests while avoiding repeat deletion when
+    # an environment variable points at one of the standard locations.
+    return tuple(dict.fromkeys(cache_dirs))
+
+
+def _compile_cache_runtime_fingerprint(*, repository_root=None) -> str:
+    """Fingerprint code and packages that can change generated GPU kernels."""
+
+    import hashlib
+    import importlib.metadata
+
+    root = (
+        Path(__file__).resolve().parents[1]
+        if repository_root is None
+        else Path(repository_root)
+    )
+    runtime_files = [
+        root / "neurons" / "miner.py",
+        root / "neurons" / "version.py",
+        root / "verallm" / "api" / "server.py",
+    ]
+    runtime_files.extend(
+        sorted((root / "verallm" / "miner").glob("*.so"))
+    )
+    runtime_files.extend(
+        sorted((root / "verallm" / "vllm_plugin").glob("*.py"))
+    )
+    digest = hashlib.sha256()
+    digest.update(sys.version.encode("utf-8"))
+    for package in ("torch", "triton", "vllm"):
+        try:
+            version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            version = "missing"
+        digest.update(f"\0package:{package}={version}".encode("utf-8"))
+    for path in runtime_files:
+        if not path.is_file():
+            continue
+        digest.update(f"\0file:{path.relative_to(root)}\0".encode("utf-8"))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _clear_stale_compile_caches(
+    *,
+    marker_path=None,
+    lock_path=None,
+    runtime_fingerprint=None,
+) -> bool:
+    """Clear stale compile caches once per installed runtime fingerprint.
+
+    Same-host endpoint processes share the Torch/Triton caches.  A host lock
+    prevents sibling miners from deleting a cache another process has just
+    warmed, while the content fingerprint preserves mandatory invalidation
+    whenever code or the Torch/Triton/vLLM stack changes.
+    """
+    import fcntl
+    import shutil
+
+    state_dir = Path.home() / ".cache" / "verathos"
+    marker = (
+        state_dir / "compile-cache-runtime.sha256"
+        if marker_path is None
+        else Path(marker_path)
+    )
+    lock = (
+        state_dir / "compile-cache-runtime.lock"
+        if lock_path is None
+        else Path(lock_path)
+    )
+    fingerprint = (
+        _compile_cache_runtime_fingerprint()
+        if runtime_fingerprint is None
+        else str(runtime_fingerprint)
+    )
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+
     cleared = 0
-    for d in cache_dirs:
-        if d.is_dir():
-            try:
-                shutil.rmtree(d)
-                cleared += 1
-            except Exception:
-                pass
+    failed = 0
+    with lock.open("a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if marker.is_file() and marker.read_text().strip() == fingerprint:
+                return False
+        except OSError:
+            pass
+        for cache_dir in _compile_cache_dirs():
+            if cache_dir.is_dir():
+                try:
+                    shutil.rmtree(cache_dir)
+                    cleared += 1
+                except Exception:
+                    failed += 1
+        if failed:
+            bt.logging.warning(
+                f"Could not clear {failed} stale torch/triton compile cache(s)"
+            )
+            return False
+        marker.write_text(fingerprint + "\n")
     if cleared:
-        bt.logging.info(f"Cleared {cleared} stale torch/triton compile caches")
+        bt.logging.info(
+            f"Cleared {cleared} stale torch/triton compile caches for a new runtime"
+        )
+    return True
 
 
 def main():
@@ -1486,7 +2471,18 @@ def main():
 
     args, server_args = parse_args()
     setup_neuron_logging(args)
+    _reconcile_managed_nginx_read_timeout()
     _clear_stale_compile_caches()
+
+    # The updater executing the first v1 -> v3 fast-forward is still the old
+    # in-memory module and cannot install a newly introduced CUDA wheel.  The
+    # restarted miner verifies the installed payload byte-for-byte against the
+    # selected bundled wheel and installs it only when missing or stale.
+    from neurons.auto_update import ensure_local_proof_v3_cuda_wheel
+
+    if not ensure_local_proof_v3_cuda_wheel():
+        bt.logging.error("Proof-v3 CUDA runtime installation failed")
+        sys.exit(1)
 
     if not args.wallet and not args.private_key:
         bt.logging.error("Either --wallet or --private-key is required")
@@ -1501,11 +2497,7 @@ def main():
         sys.exit(1)
     args.chain_config = resolved_chain_path  # update for downstream use
 
-    config = NeuronConfig.from_env(
-        wallet_name=args.wallet or "default",
-        hotkey_name=args.hotkey,
-        netuid=args.netuid,
-    )
+    config = _neuron_config_from_args(args)
     if getattr(args, "capacity_audit", False):
         config.capacity_audit_enabled = True
 
@@ -1522,9 +2514,28 @@ def main():
     )
     bt.logging.info(f"Model config: {resolved.model_id} quant={resolved.quant} ctx={resolved.max_context_len}")
 
-    # Resolve EVM RPC URL: explicit endpoint > network default > JSON default
+    try:
+        defaulted_fp8_env = _configure_proof_safe_fp8_backend(resolved.quant)
+    except RuntimeError as exc:
+        bt.logging.error(str(exc))
+        sys.exit(1)
+    if defaulted_fp8_env:
+        bt.logging.info(
+            "Applied proof-safe FP8 backend defaults before model load: "
+            + ", ".join(f"{name}=0" for name in defaulted_fp8_env)
+        )
+
+    explicit_chain_endpoint = getattr(args, "subtensor_chain_endpoint", None)
+    if ChainConfig.should_warn_public_rpc(explicit_chain_endpoint):
+        bt.logging.warning(
+            "Public Bittensor RPC configured. Public endpoints are rate-limited "
+            "and may make miner registration, heartbeats, and capacity audits "
+            "unstable. For production mining, run a Subtensor node and pass "
+            "its endpoint with --subtensor-chain-endpoint."
+        )
+
     rpc_override = ChainConfig.resolve_rpc_url(
-        getattr(args, "subtensor_chain_endpoint", None),
+        explicit_chain_endpoint,
         args.subtensor_network,
     )
     chain_config = ChainConfig.from_json(
@@ -1536,8 +2547,8 @@ def main():
             setattr(config, k, getattr(chain_config, k))
 
     # Set Substrate network from CLI args
-    if getattr(args, "subtensor_chain_endpoint", None):
-        ep = args.subtensor_chain_endpoint
+    if explicit_chain_endpoint:
+        ep = explicit_chain_endpoint
         ws_ep = ep.replace("http://", "ws://").replace("https://", "wss://")
         config.subtensor_network = ws_ep
     elif args.subtensor_network:
@@ -1584,6 +2595,7 @@ def main():
     # it into GPU. This avoids wasting ~60s on model load + root
     # computation only to fail at _chain_self_check in the server.
     on_chain_models: list[str] | None = None
+    model_client = None
     if chain_config.model_registry_address:
         try:
             from verallm.chain.model_registry import ModelRegistryClient
@@ -1612,7 +2624,69 @@ def main():
                 f"The server will re-check after model load."
             )
 
+    from verallm.proof_v3.artifact_store import (
+        configured_proof_v3_artifact_base_urls,
+    )
+
+    proof_v3_sources = configured_proof_v3_artifact_base_urls(
+        args.proof_v3_artifact_base_url,
+        default_values=getattr(
+            chain_config,
+            "proof_v3_artifact_base_urls",
+            (),
+        ),
+    )
+    resolved_v3 = None
+    proof_v3_cache_directory = (
+        args.proof_v3_artifact_cache_dir
+        or getattr(
+            chain_config,
+            "proof_v3_artifact_cache_dir",
+            "",
+        )
+        or None
+    )
+    proof_v3_descriptor = str(args.proof_v3_release or "").strip()
+    if proof_v3_descriptor and proof_v3_sources:
+        bt.logging.info(
+            "Using explicit proof-v3 release descriptor instead of remote "
+            "artifact discovery"
+        )
+    if not proof_v3_descriptor and proof_v3_sources:
+        if model_client is None:
+            bt.logging.error(
+                "Remote proof-v3 releases require ModelRegistry access"
+            )
+            sys.exit(1)
+        try:
+            from verallm.proof_v3.artifact_store import (
+                resolve_remote_proof_v3_release,
+            )
+
+            resolved_v3 = resolve_remote_proof_v3_release(
+                resolved.model_id,
+                proof_v3_sources,
+                chain_config=chain_config,
+                model_registry_client=model_client,
+                cache_directory=proof_v3_cache_directory,
+            )
+            proof_v3_descriptor = str(resolved_v3.descriptor_path)
+            bt.logging.info(
+                "Authenticated cached proof-v3 release from "
+                f"{resolved_v3.index_source_url}"
+            )
+        except Exception as exc:
+            bt.logging.error(f"Proof-v3 artifact resolution failed: {exc}")
+            sys.exit(1)
+    if proof_v3_descriptor:
+        try:
+            _apply_proof_v3_release_descriptor(args, proof_v3_descriptor)
+        except Exception as exc:
+            bt.logging.error(f"Proof-v3 release configuration failed: {exc}")
+            sys.exit(1)
+
     neuron = MinerNeuron(config)
+    neuron._proof_v3_configured = bool(args.proof_v3_manifest)
 
     def signal_handler(sig, _frame):
         bt.logging.info(f"Received signal {sig}, shutting down")
@@ -1667,6 +2741,38 @@ def main():
     if chain_config.rpc_url and "--evm-rpc-url" not in server_args:
         server_args.extend(["--evm-rpc-url", chain_config.rpc_url])
 
+    server_args = _forward_proof_v2_artifacts(
+        server_args,
+        manifest=args.proof_v2_manifest,
+        weight_catalog=args.proof_v2_weight_catalog,
+        artifact_base_urls=args.proof_v2_artifact_base_url,
+        artifact_cache_dir=args.proof_v2_artifact_cache_dir,
+    )
+    server_args = _forward_proof_v3_artifacts(
+        server_args,
+        manifest=args.proof_v3_manifest,
+        execution_profile=args.proof_v3_execution_profile,
+        calibration_set=args.proof_v3_calibration_set,
+        attention_semantics=args.proof_v3_attention_semantics,
+        gdn_semantics=args.proof_v3_gdn_semantics,
+        lm_head_catalog=args.proof_v3_lm_head_catalog,
+        projection_manifest=args.proof_v3_projection_manifest,
+        projection_catalog=args.proof_v3_projection_catalog,
+        runtime_encoding=args.proof_v3_runtime_encoding,
+        weight_cache_dir=args.proof_v3_weight_cache_dir,
+    )
+    if args.proof_v3_manifest:
+        if not neuron.hotkey_ss58:
+            bt.logging.error(
+                "Proof-v3 requires a Bittensor wallet hotkey identity; "
+                "direct EVM private-key mode is unsupported."
+            )
+            sys.exit(1)
+        if "--miner-hotkey-ss58" not in server_args:
+            server_args.extend(
+                ["--miner-hotkey-ss58", neuron.hotkey_ss58]
+            )
+
     # Forward TEE args to server subprocess
     if args.tee_enabled and "--tee-enabled" not in server_args:
         server_args.append("--tee-enabled")
@@ -1696,6 +2802,26 @@ def main():
             neuron._refresh_validator_allowlist()
         except Exception as e:
             bt.logging.warning(f"Initial validator allowlist write failed: {e} — server will block until next refresh succeeds")
+    served_proof_protocol_versions = (
+        neuron._served_proof_protocol_versions
+        or _configured_miner_proof_protocol_versions(
+            config.proof_protocol_allowed_versions,
+            proof_v3_configured=bool(args.proof_v3_manifest),
+        )
+    )
+    if not served_proof_protocol_versions:
+        bt.logging.error(
+            "Miner has no configured proof protocol allowed by the subnet"
+        )
+        sys.exit(1)
+    server_args = _set_server_arg(
+        server_args,
+        "--allowed-proof-protocol-versions",
+        ",".join(
+            str(version)
+            for version in served_proof_protocol_versions
+        ),
+    )
 
     # ── External port reachability check ──
     # Verify the endpoint port is reachable from outside BEFORE loading vLLM
@@ -1834,15 +2960,33 @@ def main():
 
     # ── Auto-updater ──
     if args.auto_update:
-        from neurons.auto_update import AutoUpdater
+        from neurons.auto_update import AutoUpdater, derive_jitter_seed
+
+        def _miner_busy() -> bool:
+            return neuron._auto_update_busy(local_health_url)
 
         updater = AutoUpdater(
             role="miner",
             check_interval=args.auto_update_interval,
+            busy_check=_miner_busy,
             jitter_seconds=args.auto_update_jitter,
-            jitter_seed=neuron.hotkey_seed,
+            jitter_seed=derive_jitter_seed(
+                neuron.hotkey_seed,
+                _extract_server_port(server_args),
+            ),
         )
         updater.start()
+
+    if resolved_v3 is not None:
+        neuron.start_proof_v3_artifact_refresh(
+            model_id=resolved.model_id,
+            base_urls=proof_v3_sources,
+            chain_config=chain_config,
+            model_registry_client=model_client,
+            cache_directory=proof_v3_cache_directory,
+            current_release_sha256=resolved_v3.release_sha256,
+            local_health_url=local_health_url,
+        )
 
     bt.logging.success(
         f"Miner ready — serving {resolved.model_id} ({resolved.quant}) "

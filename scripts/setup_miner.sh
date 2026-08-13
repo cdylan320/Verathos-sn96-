@@ -24,6 +24,41 @@
 set -e
 set -o pipefail
 
+resolve_miner_runtime_stack() {
+    local gpu_sm="${1:-}"
+    local driver_major="${2:-0}"
+
+    if ! [[ "$gpu_sm" =~ ^[0-9]+$ ]] ||
+        ! [[ "$driver_major" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: GPU compute capability and driver major must be integers." >&2
+        return 2
+    fi
+
+    if [ "$gpu_sm" -lt 89 ]; then
+        printf '%s\n' 'ampere-cu128|0.19.1|2.10.0+cu128|12.8|cu128'
+    elif { [ "$gpu_sm" -eq 90 ] || [ "$gpu_sm" -ge 120 ]; } &&
+        [ "$driver_major" -ge 580 ]; then
+        # vLLM 0.20.2's published binary is CUDA 13-linked. Hopper and
+        # Blackwell hosts on a CUDA 13-capable driver must therefore use the
+        # coherent torch/vLLM CUDA 13 stack instead of forcing cu128 and then
+        # falling into an unnecessary source rebuild.
+        printf '%s\n' 'hopper-blackwell-cu130|0.20.2|2.11.0+cu130|13.0|cu130'
+    else
+        printf '%s\n' 'ada-hopper-cu128|0.20.2|2.11.0+cu128|12.8|cu128'
+    fi
+}
+
+# Deterministic diagnostic used by the installer regression suite. It runs no
+# setup actions and keeps the architecture policy executable in one place.
+if [ "${1:-}" = "--resolve-runtime-selection" ]; then
+    if [ "$#" -ne 3 ]; then
+        echo "Usage: $0 --resolve-runtime-selection <sm> <driver-major>" >&2
+        exit 2
+    fi
+    resolve_miner_runtime_stack "$2" "$3"
+    exit $?
+fi
+
 # ── Parse arguments ──────────────────────────────────────────────────────────
 
 SKIP_INSTALL=false
@@ -166,6 +201,9 @@ if ! command -v nvidia-smi &>/dev/null; then
     echo "  ERROR: nvidia-smi not found. NVIDIA GPU required."
     exit 1
 fi
+# Query the first visible device directly.  With pipefail enabled, piping a
+# multi-GPU nvidia-smi result through head can terminate nvidia-smi with
+# SIGPIPE and abort an otherwise healthy one-command install.
 GPU_NAME=$(nvidia-smi -i 0 --query-gpu=name --format=csv,noheader 2>/dev/null)
 GPU_VRAM=$(nvidia-smi -i 0 --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null)
 if [ -z "$GPU_NAME" ]; then
@@ -179,6 +217,10 @@ fi
 GPU_SM=$(nvidia-smi -i 0 --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '.')
 GPU_DRIVER=$(nvidia-smi -i 0 --query-gpu=driver_version --format=csv,noheader 2>/dev/null)
 GPU_DRIVER_MAJOR=$(echo "$GPU_DRIVER" | cut -d. -f1)
+RUNTIME_SELECTION=$(resolve_miner_runtime_stack "$GPU_SM" "${GPU_DRIVER_MAJOR:-0}")
+IFS='|' read -r VLLM_RUNTIME_STACK VLLM_RUNTIME_VERSION \
+    TORCH_RUNTIME_VERSION TORCH_CUDA_VERSION TORCH_CUDA_TAG \
+    <<< "$RUNTIME_SELECTION"
 echo "  GPU: $GPU_NAME (${GPU_VRAM}MB, sm_${GPU_SM}, driver ${GPU_DRIVER})"
 # Early check: RTX 5090 requires NVIDIA driver >= 575.
 #
@@ -204,10 +246,10 @@ if [ "${GPU_SM:-0}" -ge 120 ] && [ "${GPU_DRIVER_MAJOR:-0}" -lt 575 ]; then
 fi
 
 # ── vLLM version policy & known issues ──────────────────────────────────────
-# Default install: vLLM 0.19.x (pinned in pyproject.toml [vllm] extra).
-# Ships torch 2.10 + cu128.  Production-tested on sm_80/86/89/90/120
-# (Ampere/Ada/Hopper/Blackwell) — UID 94 (H100), UID 91 (RTX 5090),
-# UID 140 (RTX 4090) all run on this stack.
+# The default install selects a qualified architecture/runtime pair below:
+# Ampere uses vLLM 0.19.1 + torch 2.10/cu128; Ada and older-driver Hopper use
+# vLLM 0.20.2 + torch 2.11/cu128; CUDA-13-capable Hopper/Blackwell uses vLLM
+# 0.20.2 + torch 2.11/cu130. Do not mix torch and vLLM across those pairs.
 #
 # KNOWN ISSUE: A small number of sm_89 operators (RTX 4090 / L4 / L40S
 # / RTX 6000 Ada) hit `cudaErrorIllegalAddress` during model load
@@ -292,6 +334,131 @@ print(':'.join(d for d in dirs if os.path.isdir(d)))
 }
 
 fix_ld_library_path
+
+# vLLM's Qwen3.6 GDN path compiles a small FlashInfer kernel during the first
+# production warmup.  CUDA runtime wheels are sufficient for torch/vLLM, but
+# they do not provide nvcc.  On the qualified CUDA 13 Hopper/Blackwell lane,
+# keep the compiler in the miner venv so a clean cloud image needs no manual
+# system-toolkit installation.
+configure_runtime_cuda_compiler() {
+    if [ "$VLLM_RUNTIME_STACK" != "hopper-blackwell-cu130" ]; then
+        return 0
+    fi
+
+    local candidate=""
+    local compiler_cuda=""
+    local root
+    for root in "${CUDA_HOME:-}" /usr/local/cuda /usr/local/cuda-*; do
+        if [ -n "$root" ] && [ -x "$root/bin/nvcc" ]; then
+            compiler_cuda=$(
+                "$root/bin/nvcc" --version 2>/dev/null |
+                    sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' |
+                    head -1
+            )
+            if [ "$compiler_cuda" = "$TORCH_CUDA_VERSION" ]; then
+                candidate="$root"
+                break
+            fi
+        fi
+    done
+
+    if [ -z "$candidate" ]; then
+        candidate=$($PYTHON - <<'PY'
+import pathlib
+import site
+
+for site_root in site.getsitepackages():
+    cuda_root = pathlib.Path(site_root) / "nvidia" / "cu13"
+    if (cuda_root / "bin" / "nvcc").is_file():
+        print(cuda_root)
+        break
+PY
+        )
+    fi
+
+    if [ -z "$candidate" ]; then
+        echo "  Installing the CUDA ${TORCH_CUDA_VERSION} compiler required by production warmup..."
+        $PYTHON -m pip install --no-cache-dir \
+            "nvidia-cuda-nvcc==${TORCH_CUDA_VERSION}.*" \
+            "nvidia-cuda-cccl==${TORCH_CUDA_VERSION}.*" \
+            "nvidia-nvvm==${TORCH_CUDA_VERSION}.*" \
+            "nvidia-cuda-crt==${TORCH_CUDA_VERSION}.*" 2>&1 | tail -10
+        candidate=$($PYTHON - <<'PY'
+import pathlib
+import site
+
+for site_root in site.getsitepackages():
+    cuda_root = pathlib.Path(site_root) / "nvidia" / "cu13"
+    if (cuda_root / "bin" / "nvcc").is_file():
+        print(cuda_root)
+        break
+PY
+        )
+    fi
+
+    if [ -z "$candidate" ] || [ ! -x "$candidate/bin/nvcc" ]; then
+        echo "  ERROR: CUDA ${TORCH_CUDA_VERSION} nvcc is required for the qualified H100/Blackwell warmup path."
+        return 1
+    fi
+
+    compiler_cuda=$(
+        "$candidate/bin/nvcc" --version 2>/dev/null |
+            sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' |
+            head -1
+    )
+    if [ "$compiler_cuda" != "$TORCH_CUDA_VERSION" ]; then
+        echo "  ERROR: CUDA compiler $compiler_cuda does not match torch CUDA $TORCH_CUDA_VERSION."
+        return 1
+    fi
+
+    export CUDA_HOME="$candidate"
+    export PATH="$CUDA_HOME/bin:$PATH"
+    if [ -d "$CUDA_HOME/lib" ]; then
+        # The venv CUDA packages expose versioned runtime SONAMEs.  Extension
+        # linkers request the unversioned development names.
+        local library soname
+        for library in libcudart libcublas libcublasLt; do
+            if [ ! -e "$CUDA_HOME/lib/${library}.so" ]; then
+                soname=$(
+                    find "$CUDA_HOME/lib" -maxdepth 1 -type f \
+                        -name "${library}.so.*" -printf '%f\n' \
+                        2>/dev/null | sort -V | head -1
+                )
+                if [ -n "$soname" ]; then
+                    ln -s "$soname" "$CUDA_HOME/lib/${library}.so"
+                fi
+            fi
+        done
+        export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
+        export LIBRARY_PATH="$CUDA_HOME/lib:${LIBRARY_PATH:-}"
+    elif [ -d "$CUDA_HOME/lib64" ]; then
+        export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+        export LIBRARY_PATH="$CUDA_HOME/lib64:${LIBRARY_PATH:-}"
+    fi
+    echo "  CUDA compiler: $($CUDA_HOME/bin/nvcc --version | tail -1)"
+}
+
+warm_hopper_gdn_kernel() {
+    if [ "$GPU_SM" != "90" ] ||
+        [ "$VLLM_RUNTIME_STACK" != "hopper-blackwell-cu130" ]; then
+        return 0
+    fi
+
+    echo "  Warming the FlashInfer H100 GDN kernel..."
+    if ! timeout 600 env MAX_JOBS="${MAX_JOBS:-$(nproc)}" "$PYTHON" - <<'PY'
+import torch
+from flashinfer.gdn_prefill import get_gdn_prefill_module
+
+module = get_gdn_prefill_module()
+assert hasattr(module, "gdn_prefill"), "FlashInfer GDN kernel is incomplete"
+torch.cuda.synchronize()
+print("  FlashInfer H100 GDN kernel: OK")
+PY
+    then
+        echo "  ERROR: the production H100 GDN warmup could not compile and load."
+        return 1
+    fi
+}
 
 ensure_proof_cuda12_libraries() {
     local missing_packages
@@ -399,7 +566,13 @@ if cuobjdump is not None:
 else:
     # No cuobjdump available — fall back to known wheel arch list.
     known = {80, 86, 89, 90}
-    if sm not in known:
+    cuda = str(getattr(torch.version, 'cuda', '') or '')
+    # CUDA 13 wheels are the supported forward path for Blackwell. Do not
+    # reject one solely because this host image lacks cuobjdump; the runtime
+    # Marlin smoke below is the authoritative compatibility check.
+    if sm >= 120 and cuda.startswith('13.'):
+        pass
+    elif sm not in known:
         print(f'{sm_str} not in known wheel archs {known}')
         sys.exit(1)
 
@@ -602,6 +775,49 @@ if [ "${WORKSPACE_IS_FUSE:-0}" = "1" ]; then
 fi
 
 # ── System dependencies ────────────────────────────────────────────────────
+# vLLM/Triton may compile small runtime launchers even when all Verathos native
+# artifacts come from wheels.  A minimal cloud image therefore still needs a C
+# compiler on the ordinary serving path.
+if ! command -v cc &>/dev/null; then
+    SYSTEM_PY_VER=$($PYTHON -c \
+        "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    if can_run_privileged; then
+        if command -v apt-get &>/dev/null; then
+            run_privileged apt-get update -qq
+            run_privileged apt-get install -y -qq \
+                build-essential "python${SYSTEM_PY_VER}-dev" >/dev/null
+        elif command -v dnf &>/dev/null; then
+            run_privileged dnf install -y gcc gcc-c++ python3-devel >/dev/null
+        fi
+    fi
+    if ! command -v cc &>/dev/null; then
+        echo "  ERROR: a C compiler is required by the vLLM/Triton runtime."
+        echo "  Install build-essential (Debian/Ubuntu) or gcc (RHEL/Fedora), then rerun setup."
+        exit 1
+    fi
+fi
+
+PYTHON_INCLUDE=$($PYTHON -c \
+    "import sysconfig; print(sysconfig.get_path('include') or '')")
+if [ -z "$PYTHON_INCLUDE" ] || [ ! -f "$PYTHON_INCLUDE/Python.h" ]; then
+    SYSTEM_PY_VER=$($PYTHON -c \
+        "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    if can_run_privileged && command -v apt-get &>/dev/null; then
+        run_privileged apt-get update -qq
+        run_privileged apt-get install -y -qq \
+            "python${SYSTEM_PY_VER}-dev" >/dev/null
+    elif can_run_privileged && command -v dnf &>/dev/null; then
+        run_privileged dnf install -y python3-devel >/dev/null
+    fi
+    PYTHON_INCLUDE=$($PYTHON -c \
+        "import sysconfig; print(sysconfig.get_path('include') or '')")
+    if [ -z "$PYTHON_INCLUDE" ] || [ ! -f "$PYTHON_INCLUDE/Python.h" ]; then
+        echo "  ERROR: Python development headers are required by the vLLM/Triton runtime."
+        echo "  Install python${SYSTEM_PY_VER}-dev (Debian/Ubuntu) or python3-devel (RHEL/Fedora), then rerun setup."
+        exit 1
+    fi
+fi
+
 # ninja-build: required by FlashInfer JIT compilation on Hopper/Blackwell (sm_90+)
 if ! command -v ninja &>/dev/null; then
     if can_run_privileged; then
@@ -614,7 +830,77 @@ if ! command -v ninja &>/dev/null; then
     # If system install failed, pip fallback happens after venv activation below
 fi
 
+ensure_node_runtime() {
+    local node_major=0
+    if command -v node &>/dev/null; then
+        node_major=$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)
+    fi
+    if [ "$node_major" -ge 18 ] 2>/dev/null && command -v npm &>/dev/null; then
+        return 0
+    fi
+
+    local SUDO=""
+    if [ "$(id -u)" -ne 0 ]; then
+        if sudo -n true 2>/dev/null; then
+            SUDO="sudo"
+        else
+            echo "  ERROR: Node.js >= 18 is required and sudo is unavailable."
+            echo "  Install Node.js >= 18, then rerun this setup."
+            exit 1
+        fi
+    fi
+
+    echo "  Installing Node.js 20 runtime..."
+    if command -v apt-get &>/dev/null; then
+        $SUDO apt-get update -qq
+        $SUDO apt-get install -y -qq ca-certificates curl gnupg 2>&1 | tail -3
+        # Ubuntu 22.04 may have Node 12 plus libnode-dev preinstalled.
+        # NodeSource's Node 20 package owns the same headers, so remove the
+        # obsolete distro packages first instead of leaving dpkg to fail on
+        # an overwrite conflict.
+        if [ "$node_major" -gt 0 ] 2>/dev/null; then
+            $SUDO apt-get remove -y -qq nodejs npm libnode-dev 2>&1 | tail -5
+        fi
+        local key_tmp
+        key_tmp=$(mktemp)
+        if ! curl -fsSL \
+            https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+            -o "$key_tmp"; then
+            rm -f "$key_tmp"
+            echo "  ERROR: could not download the NodeSource signing key."
+            exit 1
+        fi
+        $SUDO mkdir -p /etc/apt/keyrings
+        $SUDO gpg --batch --yes --dearmor \
+            -o /etc/apt/keyrings/nodesource.gpg "$key_tmp"
+        rm -f "$key_tmp"
+        printf '%s\n' \
+            'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' \
+            | $SUDO tee /etc/apt/sources.list.d/nodesource.list >/dev/null
+        $SUDO apt-get update -qq
+        $SUDO apt-get install -y -qq nodejs 2>&1 | tail -5
+    elif command -v dnf &>/dev/null; then
+        $SUDO dnf module enable -y nodejs:20 2>&1 | tail -3 || true
+        $SUDO dnf install -y nodejs npm 2>&1 | tail -5
+    else
+        echo "  ERROR: no supported package manager can install Node.js >= 18."
+        exit 1
+    fi
+
+    hash -r
+    node_major=0
+    if command -v node &>/dev/null; then
+        node_major=$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)
+    fi
+    if [ "$node_major" -lt 18 ] 2>/dev/null || ! command -v npm &>/dev/null; then
+        echo "  ERROR: setup did not produce a working Node.js >= 18 runtime."
+        exit 1
+    fi
+    echo "  Node.js ready: $(node --version)"
+}
+
 install_pm2_if_missing() {
+    ensure_node_runtime
     if command -v pm2 &>/dev/null; then
         return 0
     fi
@@ -622,33 +908,7 @@ install_pm2_if_missing() {
     echo "  Installing PM2 process manager..."
     local SUDO=""
     if [ "$(id -u)" -ne 0 ]; then
-        if sudo -n true 2>/dev/null; then
-            SUDO="sudo"
-        else
-            echo "  ERROR: pm2 is not installed and sudo is unavailable."
-            echo "  Install Node.js/npm and PM2, then rerun this setup:"
-            echo "    npm install -g pm2"
-            exit 1
-        fi
-    fi
-
-    if ! command -v npm &>/dev/null; then
-        if command -v apt-get &>/dev/null; then
-            $SUDO apt-get update -qq
-            $SUDO apt-get install -y -qq nodejs npm 2>&1 | tail -3
-        elif command -v dnf &>/dev/null; then
-            $SUDO dnf install -y nodejs npm 2>&1 | tail -3
-        else
-            echo "  ERROR: npm not found and no supported system package manager detected."
-            echo "  Install Node.js/npm and PM2, then rerun this setup:"
-            echo "    npm install -g pm2"
-            exit 1
-        fi
-    fi
-
-    if ! command -v npm &>/dev/null; then
-        echo "  ERROR: npm install failed or npm is still not on PATH."
-        exit 1
+        SUDO="sudo"
     fi
     $SUDO npm install -g pm2 >/dev/null
     if ! command -v pm2 &>/dev/null; then
@@ -763,9 +1023,10 @@ if [ "$SKIP_INSTALL" = false ]; then
     #
     # Net selection:
     #  - sm < 89 (Ampere): vLLM 0.19.1 + torch 2.10.0 + cu128
-    #  - sm >= 120 with driver >= 580: vLLM 0.20.2 + torch 2.11.0 + cu130
+    #  - sm 90 or sm >= 120 with driver >= 580: vLLM 0.20.2 + torch
+    #    2.11.0 + cu130
     #  - sm >= 89 otherwise: vLLM 0.20.2 + torch 2.11.0 + cu128
-    if [ "${GPU_SM:-0}" -lt 89 ] 2>/dev/null; then
+    if [ "$VLLM_RUNTIME_STACK" = "ampere-cu128" ]; then
         VLLM_SOURCE_TAG="v0.19.1"
         echo "  Ampere GPU (sm_${GPU_SM}): installing vLLM 0.19.1 + torch 2.10.0+cu128..."
         TORCH_CONSTRAINT="$(mktemp)"
@@ -793,19 +1054,19 @@ if [ "$SKIP_INSTALL" = false ]; then
         else
             $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.19.1' 2>&1 | tail -5
         fi
-    elif [ "${GPU_SM:-0}" -ge 120 ] 2>/dev/null && [ "${GPU_DRIVER_MAJOR:-0}" -ge 580 ] 2>/dev/null; then
+    elif [ "$VLLM_RUNTIME_STACK" = "hopper-blackwell-cu130" ]; then
         VLLM_SOURCE_TAG="v0.20.2"
-        echo "  Blackwell GPU (sm_${GPU_SM}) on driver ${GPU_DRIVER}: installing vLLM 0.20.2 + torch 2.11.0+cu130..."
+        echo "  Hopper/Blackwell GPU (sm_${GPU_SM}) on driver ${GPU_DRIVER}: installing vLLM 0.20.2 + torch 2.11.0+cu130..."
         $PYTHON -m pip install --no-cache-dir \
             "vllm==0.20.2" "${VLLM_RUNTIME_DEPS[@]}" 2>&1 | tail -20
-        echo "  Verifying Blackwell torch/vLLM pins..."
+        echo "  Verifying Hopper/Blackwell torch/vLLM pins..."
         if torch_pin_ready "2.11.0+cu130" "13."; then
             echo "  torch 2.11.0+cu130 already installed"
         else
             $PYTHON -m pip install --no-cache-dir --force-reinstall \
                 "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" 2>&1 | tail -10
             if ! torch_pin_ready "2.11.0+cu130" "13."; then
-                echo "  ERROR: expected torch 2.11.0+cu130 on Blackwell/CUDA 13, but verification failed."
+                echo "  ERROR: expected torch 2.11.0+cu130 on Hopper/Blackwell CUDA 13, but verification failed."
                 echo "  Use a CUDA 13-capable image/driver or retry on a newer host."
                 exit 1
             fi
@@ -845,6 +1106,13 @@ if [ "$SKIP_INSTALL" = false ]; then
         if [ "${GPU_DRIVER_MAJOR:-0}" -lt 580 ] 2>/dev/null; then
             echo "  Driver ${GPU_DRIVER} is < 580: using cu128 torch and validating the vLLM wheel before any rebuild."
         fi
+    fi
+
+    if ! configure_runtime_cuda_compiler; then
+        exit 1
+    fi
+    if ! warm_hopper_gdn_kernel; then
+        exit 1
     fi
 
     echo "  Installing Verathos API deps..."
@@ -905,6 +1173,26 @@ if [ "$SKIP_INSTALL" = false ]; then
     else
         echo "  vLLM CUDA kernels: compatible"
     fi
+
+    if ! $PYTHON - <<'PY'
+from zkllm.crypto.pcs_v2 import (
+    ABI_VERSION,
+    fold_u31_linear_coefficients,
+    native_library_path,
+    prove_i64_linear_combination_linear,
+)
+
+assert ABI_VERSION == 10, f"expected proof PCS ABI 10, got {ABI_VERSION}"
+assert callable(fold_u31_linear_coefficients)
+assert callable(prove_i64_linear_combination_linear)
+native_library_path()
+PY
+    then
+        echo "  ERROR: zkllm wheel is stale or lacks the proof PCS ABI required by this release."
+        echo "  Rebuild the release wheels with scripts/build_zkllm_wheel.sh."
+        exit 1
+    fi
+    echo "  Proof PCS ABI 10: OK"
 
     echo ""
     echo "Step 3/6: GPTQ quantization support..."
@@ -982,13 +1270,13 @@ except Exception as e:
     }
 
     echo ""
-    echo "Step 5/6: Verifying zkllm CUDA extension..."
+    echo "Step 5/6: Verifying proof CUDA extensions..."
     fix_ld_library_path
     # zkllm is installed as a wheel — no build needed.
     # The wheel auto-detects the correct torch version at import time.
     #
     # Defensive cleanup: if any zkllm_native .so sits in the *source* tree
-    # (e.g. left over from a previous rsync of verathos-core, or from an
+    # (e.g. left over from a previous source-tree sync, or from an
     # aborted JIT build, or from a different Python version's build), it
     # will shadow the correctly-installed wheel in site-packages because
     # Python's implicit `sys.path[0]=""` puts the source tree first when
@@ -1005,13 +1293,85 @@ except Exception as e:
             -name "zkllm_native.cpython-*.so.torch*" \
         \) -delete 2>/dev/null || true
     fi
+    TORCH_CUDA_RUNTIME=$($PYTHON -c '
+import torch
+cuda = str(torch.version.cuda or "")
+if cuda.startswith("12.8"):
+    print("cu128")
+elif cuda.startswith("13.0"):
+    print("cu130")
+else:
+    raise SystemExit(f"unsupported torch CUDA runtime: {cuda or None}")
+') || {
+        echo "  ERROR: unsupported torch CUDA runtime for proof-v3."
+        exit 1
+    }
+    PYTHON_ABI=$($PYTHON -c \
+        'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
+    PROOF_V3_CUDA_WHEELS=(
+        "$REPO_DIR"/dist/verathos_proof_v3_cuda-*+"$TORCH_CUDA_RUNTIME"-"$PYTHON_ABI"-"$PYTHON_ABI"-*.whl
+    )
+    if [ "${#PROOF_V3_CUDA_WHEELS[@]}" -ne 1 ] ||
+        [ ! -f "${PROOF_V3_CUDA_WHEELS[0]}" ]; then
+        echo "  ERROR: expected exactly one proof-v3 CUDA runtime wheel for"
+        echo "    runtime=$TORCH_CUDA_RUNTIME python=$PYTHON_ABI"
+        echo "  Available artifacts:"
+        find "$REPO_DIR/dist" -maxdepth 1 -type f \
+            -name 'verathos_proof_v3_cuda-*.whl' -printf '    %f\n' \
+            2>/dev/null | sort
+        exit 1
+    fi
+    echo "  Installing proof-v3 CUDA runtime: $(basename "${PROOF_V3_CUDA_WHEELS[0]}")"
+    $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
+        "${PROOF_V3_CUDA_WHEELS[0]}" 2>&1 | tail -5
+    if ! $PYTHON -c "
+import torch
+from verathos_proof_v3_cuda import load_fused_kernels, load_tree_kernels
+fold = load_fused_kernels()
+tree = load_tree_kernels()
+for name in ('round_partials', 'lerp_fold', 'product_round_partials', 'fs_round_v2'):
+    assert hasattr(fold, name), f'Missing proof-v3 fold kernel: {name}'
+for name in ('leaf_hash_w1', 'leaf_hash_wn_base', 'node_hash', 'node_hash_base'):
+    assert hasattr(tree, name), f'Missing proof-v3 tree kernel: {name}'
+folded = fold.lerp_fold(
+    torch.tensor([1, 2], dtype=torch.int64, device='cuda'), 0
+)
+assert folded.cpu().tolist() == [1]
+leaf = tree.leaf_hash_wn_base(
+    torch.zeros(90, dtype=torch.uint8, device='cuda'),
+    torch.tensor([1], dtype=torch.int64, device='cuda'),
+    0,
+    1,
+)
+assert tuple(leaf.shape) == (32,)
+torch.cuda.synchronize()
+print('  Proof-v3 CUDA runtime: OK')
+" 2>/dev/null; then
+        echo "ERROR: precompiled proof-v3 CUDA runtime is unavailable or incompatible."
+        echo "  Reinstall the matching wheel from dist/verathos_proof_v3_cuda-*.whl."
+        exit 1
+    fi
     if $PYTHON -c "
 from zkllm.cuda import zkllm_native, HAS_CUDA
+from zkllm.crypto import pcs_v2
 assert zkllm_native is not None, 'zkllm_native not loaded — is the zkllm wheel installed?'
 assert HAS_CUDA, 'Extension loaded but HAS_CUDA=False — CUDA not available in zkllm'
 assert hasattr(zkllm_native, 'cuda_blake3_merkle_leaves'), 'Missing cuda_blake3_merkle_leaves kernel'
+assert hasattr(zkllm_native, 'cuda_blake3_activation_row_roots'), 'Missing proof-v3 activation row reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_runtime_row_roots_retain_into'), 'Missing proof-v3 retained-runtime activation reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_runtime_staged_row_roots_into'), 'Missing proof-v3 staged row reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_activation_update_peaks'), 'Missing proof-v3 activation frontier reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_activation_update_peaks_heterogeneous'), 'Missing proof-v3 heterogeneous frontier reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_runtime_row_roots_into'), 'Missing proof-v3 graph row reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_prehashed_update_peaks'), 'Missing proof-v3 prehashed frontier reducer'
+for name in (
+    'combine_registered_catalog_u31_batch',
+    'prove_linear',
+    'verify_linear',
+):
+    assert hasattr(pcs_v2, name), f'Missing proof-v3 PCS API: {name}'
 print(f'  HAS_CUDA: {HAS_CUDA}')
-print(f'  Kernels: blake3_merkle, sumcheck, field_ops')
+print(f'  Kernels: blake3_merkle, proof_v3_anchor, sumcheck, field_ops, linear_pcs')
 " 2>/dev/null; then
         echo "  CUDA extension: OK"
     else
@@ -1132,9 +1492,11 @@ fi
 cat > "$ENV_FILE" <<ENVEOF
 # Auto-generated by setup_miner.sh — source from .bashrc for persistent env
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
+export LIBRARY_PATH="${LIBRARY_PATH:-}"
+export CUDA_HOME="${CUDA_HOME:-}"
 export HF_HOME="${HF_HOME}"
 ${HF_TOKEN_EXPORT}
-export PATH="${REPO_DIR}/.venv-vllm/bin:\${PATH}"
+export PATH="${REPO_DIR}/.venv-vllm/bin${CUDA_HOME:+:${CUDA_HOME}/bin}:\${PATH}"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export TORCHINDUCTOR_COMPILE_THREADS="\${TORCHINDUCTOR_COMPILE_THREADS:-\${VERATHOS_TORCHINDUCTOR_COMPILE_THREADS:-4}}"
 # Runtime cache paths are persisted from setup-time detection.  On normal
@@ -1165,7 +1527,7 @@ fi
 ENVEOF
 
 BASHRC="${HOME}/.bashrc"
-if ! grep -qF "verathos/.env.sh" "$BASHRC" 2>/dev/null; then
+if ! grep -qF "${ENV_FILE}" "$BASHRC" 2>/dev/null; then
     echo "" >> "$BASHRC"
     echo "# Verathos environment (auto-added by setup_miner.sh)" >> "$BASHRC"
     echo "[ -f \"${ENV_FILE}\" ] && source \"${ENV_FILE}\"" >> "$BASHRC"
@@ -1175,6 +1537,19 @@ else
 fi
 
 # ── Show model recommendations + next steps ──────────────────────────────────
+
+if [ "$SKIP_INSTALL" = true ]; then
+    echo "  Verifying existing miner runtime (--skip-install)..."
+    "$PYTHON" - <<'PY'
+import torch
+import vllm
+import zstandard
+import zkllm
+
+assert torch.cuda.is_available(), "CUDA is unavailable"
+print(f"  Existing miner runtime: torch={torch.__version__}, vllm={vllm.__version__}")
+PY
+fi
 
 echo ""
 echo "============================================================"

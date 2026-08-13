@@ -27,15 +27,20 @@ Each neuron adds ``--auto-update`` to its argparser.  When enabled::
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import importlib.util
 import logging
 import bittensor as bt
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -43,6 +48,13 @@ logger = logging.getLogger(__name__)
 
 # Repo root = directory containing this file's parent (neurons/ -> repo root)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_FIRST_PARTY_SOURCE_ROOTS = ("neurons", "verallm", "zkllm", "trainllm")
+
+
+def derive_jitter_seed(base_seed: bytes, instance_identity: str | int) -> bytes:
+    """Domain-separate restart slots for processes sharing one identity."""
+
+    return bytes(base_seed) + b"\x00instance:" + str(instance_identity).encode("utf-8")
 
 
 def _run_git(*args: str, cwd: Optional[Path] = None) -> tuple[int, str]:
@@ -125,6 +137,177 @@ def install_local_hot_capacity_workspace_wheel(*, required: bool = True) -> bool
     return install_local_wheel("hot_capacity_workspace_cuda", required=required)
 
 
+def _proof_v3_cuda_runtime_tag() -> Optional[str]:
+    """Return the bundled proof-runtime tag for the installed torch CUDA ABI."""
+    try:
+        import torch
+    except Exception:
+        return None
+    cuda = str(torch.version.cuda or "")
+    if cuda.startswith("12.8"):
+        return "cu128"
+    if cuda.startswith("13.0"):
+        return "cu130"
+    return None
+
+
+def install_local_proof_v3_cuda_wheel() -> bool:
+    """Force-install the proof-v3 CUDA wheel matching torch and Python."""
+    runtime_tag = _proof_v3_cuda_runtime_tag()
+    if runtime_tag is None:
+        bt.logging.error(
+            "No bundled proof-v3 CUDA runtime matches the installed torch CUDA ABI"
+        )
+        return False
+    py_tag = _current_python_tag()
+    wheels = sorted(
+        (_REPO_ROOT / "dist").glob(
+            f"verathos_proof_v3_cuda-*+{runtime_tag}-{py_tag}-{py_tag}-*.whl"
+        )
+    )
+    if len(wheels) != 1:
+        bt.logging.error(
+            "Expected exactly one bundled proof-v3 CUDA wheel for "
+            f"runtime={runtime_tag} python={py_tag}; found {len(wheels)}"
+        )
+        return False
+
+    wheel = wheels[0]
+    bt.logging.info(f"Installing proof-v3 CUDA wheel: {wheel.name}")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--force-reinstall",
+                "--no-deps",
+                str(wheel),
+            ],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            bt.logging.error(f"proof-v3 CUDA wheel install failed: {result.stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        bt.logging.error("proof-v3 CUDA wheel install timed out")
+        return False
+    bt.logging.info("proof-v3 CUDA wheel installed successfully")
+    return True
+
+
+def _selected_proof_v3_cuda_wheel() -> Optional[Path]:
+    runtime_tag = _proof_v3_cuda_runtime_tag()
+    if runtime_tag is None:
+        return None
+    py_tag = _current_python_tag()
+    wheels = sorted(
+        (_REPO_ROOT / "dist").glob(
+            f"verathos_proof_v3_cuda-*+{runtime_tag}-{py_tag}-{py_tag}-*.whl"
+        )
+    )
+    return wheels[0] if len(wheels) == 1 else None
+
+
+def _installed_proof_v3_cuda_package_dir() -> Optional[Path]:
+    spec = importlib.util.find_spec("verathos_proof_v3_cuda")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    return Path(next(iter(spec.submodule_search_locations))).resolve()
+
+
+def proof_v3_cuda_wheel_is_current(wheel: Path) -> bool:
+    """Compare installed proof-runtime payload bytes with the release wheel."""
+    package_dir = _installed_proof_v3_cuda_package_dir()
+    if package_dir is None:
+        return False
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            members = [
+                name
+                for name in archive.namelist()
+                if name.startswith("verathos_proof_v3_cuda/")
+                and not name.endswith("/")
+            ]
+            if not members:
+                return False
+            for name in members:
+                installed = package_dir / Path(name).name
+                if not installed.is_file():
+                    return False
+                if hashlib.sha256(installed.read_bytes()).digest() != hashlib.sha256(
+                    archive.read(name)
+                ).digest():
+                    return False
+    except (OSError, zipfile.BadZipFile, KeyError):
+        return False
+    return True
+
+
+def proof_v3_cuda_runtime_smoke() -> bool:
+    """Load and execute both bundled kernel families in a fresh process."""
+    program = """
+import torch
+from verathos_proof_v3_cuda import load_fused_kernels, load_tree_kernels
+fold = load_fused_kernels()
+tree = load_tree_kernels()
+for name in ('round_partials', 'lerp_fold', 'product_round_partials', 'fs_round_v2'):
+    assert hasattr(fold, name), name
+for name in ('leaf_hash_w1', 'leaf_hash_wn_base', 'node_hash', 'node_hash_base'):
+    assert hasattr(tree, name), name
+folded = fold.lerp_fold(torch.tensor([1, 2], dtype=torch.int64, device='cuda'), 0)
+assert folded.cpu().tolist() == [1]
+leaf = tree.leaf_hash_wn_base(
+    torch.zeros(90, dtype=torch.uint8, device='cuda'),
+    torch.tensor([1], dtype=torch.int64, device='cuda'),
+    0,
+    1,
+)
+assert tuple(leaf.shape) == (32,)
+torch.cuda.synchronize()
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        bt.logging.error("proof-v3 CUDA runtime smoke timed out")
+        return False
+    if result.returncode != 0:
+        bt.logging.error(
+            "proof-v3 CUDA runtime smoke failed: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+        return False
+    return True
+
+
+def ensure_local_proof_v3_cuda_wheel() -> bool:
+    """Ensure first-start after an old updater has the release proof runtime."""
+    wheel = _selected_proof_v3_cuda_wheel()
+    if wheel is None:
+        bt.logging.error(
+            "No unique bundled proof-v3 CUDA wheel matches Python and torch CUDA"
+        )
+        return False
+    if not proof_v3_cuda_wheel_is_current(wheel):
+        if not install_local_proof_v3_cuda_wheel():
+            return False
+        importlib.invalidate_caches()
+        if not proof_v3_cuda_wheel_is_current(wheel):
+            return False
+    return proof_v3_cuda_runtime_smoke()
+
+
 def get_local_head() -> Optional[str]:
     """Get the current local HEAD commit hash."""
     rc, out = _run_git("rev-parse", "HEAD")
@@ -135,6 +318,37 @@ def get_current_branch() -> Optional[str]:
     """Get the current branch name."""
     rc, out = _run_git("rev-parse", "--abbrev-ref", "HEAD")
     return out if rc == 0 else None
+
+
+def _clear_first_party_bytecode_caches() -> bool:
+    """Remove stale timestamp-based bytecode after a source fast-forward.
+
+    Git can replace a same-sized Python file within the same timestamp second.
+    CPython's default bytecode header then cannot distinguish the new source
+    from the old one.  Clear only first-party ``__pycache__`` entries before
+    restart; environments and third-party packages are deliberately excluded.
+    """
+
+    try:
+        for root_name in _FIRST_PARTY_SOURCE_ROOTS:
+            source_root = _REPO_ROOT / root_name
+            if not source_root.is_dir():
+                continue
+            for cache_dir in source_root.rglob("__pycache__"):
+                if not cache_dir.is_dir():
+                    continue
+                for bytecode in cache_dir.glob("*.pyc"):
+                    bytecode.unlink()
+                try:
+                    cache_dir.rmdir()
+                except OSError:
+                    # Leave directories containing non-bytecode files alone.
+                    pass
+    except OSError as exc:
+        bt.logging.error(f"Cannot clear first-party bytecode cache: {exc}")
+        return False
+    importlib.invalidate_caches()
+    return True
 
 
 def fetch_origin() -> bool:
@@ -257,16 +471,19 @@ def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
     if not local_head or not remote_head:
         return None
 
-    # No new commits at all — skip version parsing
-    if local_head == remote_head:
-        return None
-
-    # New commits exist — check if our role's version changed
     var_name = "miner_version" if role == "miner" else "validator_version"
 
     # Local version (from the imported module)
     from neurons.version import miner_version, validator_version
     local_version = miner_version if role == "miner" else validator_version
+
+    # Validators and proxies retain the established checkout-based fast path.
+    # A stock multi-endpoint miner is different: several resident processes
+    # share one checkout, so one sibling may advance HEAD while the others
+    # still execute an older imported miner version.  Those siblings must keep
+    # comparing their in-memory version with the remote release and restart.
+    if local_head == remote_head and role != "miner":
+        return None
 
     # Remote version (from git show, without pulling)
     remote_source = _read_remote_version_file()
@@ -282,15 +499,45 @@ def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
         return None
 
     if remote_version > local_version:
-        bt.logging.info(f"Remote {var_name}={remote_version} > local {local_version} (commits: {local_head[:8]}→{remote_head[:8]})")
+        bt.logging.info(
+            f"Remote {var_name}={remote_version} > running {local_version} "
+            f"(commits: {local_head[:8]}→{remote_head[:8]})"
+        )
         return (remote_head, remote_version, local_version)
 
-    # New commits but our role's version didn't change — skip
-    bt.logging.debug(f"New commits available ({local_head[:8]}→{remote_head[:8]}) but {var_name} unchanged ({local_version}) — skipping")
+    bt.logging.debug(
+        f"Remote {var_name}={remote_version} does not exceed running "
+        f"{local_version} (commits: {local_head[:8]}→{remote_head[:8]}) — skipping"
+    )
     return None
 
 
-def pull_and_install(*, install_extras: str = "neurons") -> bool:
+def _install_lock_path() -> Path:
+    """Return the host-local lock shared by processes using this checkout."""
+
+    checkout_id = hashlib.sha256(
+        str(_REPO_ROOT.resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"verathos-auto-update-{checkout_id}.lock"
+
+
+@contextmanager
+def _exclusive_install_lock():
+    """Serialize git and package mutation across processes sharing a checkout."""
+
+    with _install_lock_path().open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _pull_and_install_locked(
+    *,
+    install_extras: str = "neurons",
+    install_proof_cuda: bool = False,
+) -> bool:
     """Pull latest code and reinstall the package.
 
     Returns True on success, False on failure.
@@ -310,6 +557,9 @@ def pull_and_install(*, install_extras: str = "neurons") -> bool:
             bt.logging.error(f"git reset also failed: {out2}")
             return False
         bt.logging.info(f"Reset to origin/{branch} successful")
+
+    if not _clear_first_party_bytecode_caches():
+        return False
 
     new_head = get_local_head()
     _head = new_head[:8] if new_head else "unknown"
@@ -340,7 +590,23 @@ def pull_and_install(*, install_extras: str = "neurons") -> bool:
     if not install_local_zkllm_wheel():
         return False
     install_local_hot_capacity_workspace_wheel(required=False)
+    if install_proof_cuda and not install_local_proof_v3_cuda_wheel():
+        return False
     return True
+
+
+def pull_and_install(
+    *,
+    install_extras: str = "neurons",
+    install_proof_cuda: bool = False,
+) -> bool:
+    """Serialize and apply one release update for a shared checkout."""
+
+    with _exclusive_install_lock():
+        return _pull_and_install_locked(
+            install_extras=install_extras,
+            install_proof_cuda=install_proof_cuda,
+        )
 
 
 def _detect_pm2() -> Optional[str]:
@@ -462,6 +728,7 @@ class AutoUpdater:
     ):
         requested_role = str(role or "validator")
         self.role = requested_role if requested_role != "proxy" else "validator"  # proxy uses validator_version
+        self.install_proof_cuda = requested_role == "miner"
         self.install_extras = (
             str(install_extras).strip()
             if install_extras is not None
@@ -474,7 +741,58 @@ class AutoUpdater:
         self.jitter_seed = bytes(jitter_seed) if jitter_seed else b""
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._update_state_lock = threading.Lock()
         self._update_pending = False  # Set when update deferred due to busy
+        self._update_applying = False
+        # A pull/install may finish before the process reaches a safe restart
+        # window.  Preserve that phase explicitly: after git HEAD advances,
+        # the running process still imports the old version and a later remote
+        # check cannot reliably rediscover the pending restart.
+        self._update_installed = False
+        self._update_stagger_completed = False
+
+    @property
+    def drain_requested(self) -> bool:
+        """Whether the caller should stop admitting new restart-sensitive work."""
+
+        with self._update_state_lock:
+            return bool(self._update_pending or self._update_applying)
+
+    def _defer_update(self) -> None:
+        with self._update_state_lock:
+            self._update_applying = False
+            self._update_pending = True
+
+    def _clear_update(self) -> None:
+        with self._update_state_lock:
+            self._update_pending = False
+            self._update_applying = False
+            self._update_installed = False
+            self._update_stagger_completed = False
+
+    def _mark_update_installed(self) -> None:
+        with self._update_state_lock:
+            self._update_installed = True
+
+    def _mark_stagger_completed(self) -> None:
+        with self._update_state_lock:
+            self._update_stagger_completed = True
+
+    def _pending_update_phase(self) -> tuple[bool, bool]:
+        with self._update_state_lock:
+            return self._update_installed, self._update_stagger_completed
+
+    def _begin_update(self, *, require_pending: bool = False) -> bool:
+        """Atomically claim the single installer/restart lane."""
+
+        with self._update_state_lock:
+            if self._update_applying:
+                return False
+            if require_pending and not self._update_pending:
+                return False
+            self._update_pending = False
+            self._update_applying = True
+            return True
 
     @staticmethod
     def _default_install_extras(role: str) -> str:
@@ -520,11 +838,16 @@ class AutoUpdater:
 
         while not self._stop_event.is_set():
             try:
-                self._check_and_update()
+                if self.drain_requested:
+                    self.notify_not_busy()
+                else:
+                    self._check_and_update()
             except Exception as e:
                 bt.logging.error(f"Auto-update check failed: {e}")
 
-            self._wait(self.check_interval)
+            # Once an update is pending, poll for the first safe idle window.
+            # The ordinary remote-version cadence remains unchanged.
+            self._wait(min(5, self.check_interval) if self.drain_requested else self.check_interval)
 
     def _wait(self, seconds: int) -> None:
         """Interruptible sleep."""
@@ -536,16 +859,53 @@ class AutoUpdater:
         If an update was deferred, applies it immediately instead of waiting
         for the next check cycle.
         """
-        if not self._update_pending:
+        if not self.drain_requested:
             return
-        bt.logging.info("Deferred update ready — applying now")
-        self._update_pending = False
-        if not pull_and_install(install_extras=self.install_extras):
-            bt.logging.error("Deferred update failed — will retry next cycle")
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Deferred update notification arrived while process is still "
+                "busy — retaining it for the next idle window"
+            )
             return
-        bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
-        time.sleep(self.restart_delay)
-        self._stagger_sleep()
+        if not self._begin_update(require_pending=True):
+            return
+        installed, stagger_completed = self._pending_update_phase()
+        if not installed:
+            bt.logging.info("Deferred update ready — applying now")
+            if not pull_and_install(
+                install_extras=self.install_extras,
+                install_proof_cuda=self.install_proof_cuda,
+            ):
+                bt.logging.error("Deferred update failed — will retry next cycle")
+                self._clear_update()
+                return
+            self._mark_update_installed()
+            bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
+            self._wait(self.restart_delay)
+            if self.busy_check and self.busy_check():
+                bt.logging.info(
+                    "Process became busy during deferred-update restart delay — "
+                    "retaining installed update for the next idle window"
+                )
+                self._defer_update()
+                return
+        else:
+            bt.logging.info(
+                "Installed update reached an idle restart window"
+            )
+        if not stagger_completed:
+            self._stagger_sleep()
+            # Fleet staggering is paid once.  If work arrives during it, the
+            # installed update waits for the next idle window without sleeping
+            # or reinstalling again.
+            self._mark_stagger_completed()
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Process became busy during update stagger — retaining installed update "
+                "for the next idle window"
+            )
+            self._defer_update()
+            return
         restart_process()
 
     def _stagger_sleep(self) -> None:
@@ -579,21 +939,34 @@ class AutoUpdater:
         # Check if we're busy
         if self.busy_check and self.busy_check():
             bt.logging.info("Process is busy — update scheduled for next idle window")
-            self._update_pending = True
+            self._defer_update()
             return
 
-        self._update_pending = False
-        if not pull_and_install(install_extras=self.install_extras):
-            bt.logging.error("Update failed — will retry next cycle")
+        if not self._begin_update():
             return
+        if not pull_and_install(
+            install_extras=self.install_extras,
+            install_proof_cuda=self.install_proof_cuda,
+        ):
+            bt.logging.error("Update failed — will retry next cycle")
+            self._clear_update()
+            return
+        self._mark_update_installed()
 
         bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
         self._wait(self.restart_delay)
 
         if self.busy_check and self.busy_check():
             bt.logging.info("Process became busy during restart delay — deferring")
-            self._update_pending = True
+            self._defer_update()
             return
 
         self._stagger_sleep()
+        self._mark_stagger_completed()
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Process became busy during update stagger — deferring restart"
+            )
+            self._defer_update()
+            return
         restart_process()

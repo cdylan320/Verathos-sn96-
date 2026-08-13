@@ -8,6 +8,34 @@ from dataclasses import dataclass
 from verallm.chain.config import ChainConfig
 
 
+TESTNET_SUBNET_CONFIG_URL = (
+    "https://verathos.ai/gleipnir/testnet/subnet-config.json"
+)
+MAINNET_SUBNET_CONFIG_URL = (
+    "https://api.verathos.ai/v1/subnet-config"
+)
+TESTNET_OWNER_VERDICT_URL = "https://verathos.ai/gleipnir/testnet"
+MAINNET_OWNER_VERDICT_URL = "https://api.verathos.ai"
+
+
+def default_subnet_config_url(network: str) -> str:
+    """Return the network-scoped public runtime-config object."""
+
+    value = str(network or "").strip().lower()
+    if value in {"test", "testnet"}:
+        return TESTNET_SUBNET_CONFIG_URL
+    return MAINNET_SUBNET_CONFIG_URL
+
+
+def default_owner_verdict_url(network: str) -> str:
+    """Return the network-scoped owner verdict feed base URL."""
+
+    value = str(network or "").strip().lower()
+    if value in {"test", "testnet"}:
+        return TESTNET_OWNER_VERDICT_URL
+    return MAINNET_OWNER_VERDICT_URL
+
+
 @dataclass
 class NeuronConfig(ChainConfig):
     """Configuration for Bittensor neuron wrappers.
@@ -30,7 +58,7 @@ class NeuronConfig(ChainConfig):
     set_weights_epoch_blocks: int = 360  # weight-setting interval (= epoch by default)
 
     # Canary testing
-    canary_small_count: int = 12  # small canary tests per miner per epoch
+    canary_small_count: int = 2  # mandatory low-context hard canaries per entry
     canary_full_context_count: int = 1  # full-context canary tests per miner per epoch
     canary_proof_sample_rate: float = 0.30  # probability of ZK proof verification on small canaries
     canary_inference_timeout: float = 300.0  # per-small-test inference timeout (seconds)
@@ -45,6 +73,15 @@ class NeuronConfig(ChainConfig):
     # Probation (proof failure penalty)
     probation_required_passes: int = 3  # consecutive clean epochs to exit probation
     probation_escalation_epochs: int = 5  # epochs on probation before reportOffline
+    # Owner runtime policy for proof-v3 hard-audit failures.  The hosted
+    # subnet config is authoritative; these conservative values are the
+    # local fallback when that config is unavailable.
+    proof_v3_failure_epochs_for_penalty: int = 1
+    proof_v3_failure_clean_epochs_for_reset: int = 3
+    # Monotonic, owner-controlled generation used for a one-time network-wide
+    # operational probation reset.  It is intentionally not exposed as an
+    # environment knob; only the owner-hosted subnet config may advance it.
+    proof_v3_probation_state_generation: int = 0
 
     # Demand bonus
     demand_bonus_enabled: bool = True  # enable per-model demand bonus
@@ -79,11 +116,24 @@ class NeuronConfig(ChainConfig):
 
     # Public subnet runtime config. This becomes the ground truth for runtime
     # tuning params once deployed; chain scoring remains fallback only.
-    subnet_config_url: str = "https://api.verathos.ai/v1/subnet-config"
+    subnet_config_url: str = TESTNET_SUBNET_CONFIG_URL
     subnet_config_refresh_seconds: float = 120.0
     subnet_config_timeout_seconds: float = 5.0
     subnet_config_cache_path: str = ""
     subnet_config_disable: bool = False
+
+    # Owner-selected inference proof versions. Maintenance forgiveness is
+    # deliberately independent from protocol admission.
+    proof_protocol_allowed_versions: tuple[int, ...] = (1, 3)
+    proof_v3_canary_policy_path: str = ""
+    proof_v3_hard_auditor_policy_enabled: bool = False
+    proof_v3_hard_auditor_hotkey_ss58: str = ""
+    proof_v3_hard_failure_url: str = ""
+    # Local operator choice. Ordinary validators follow the designated owner;
+    # owner and independent-verifier deployments explicitly opt into verify.
+    # Hosted runtime config must never change this.
+    proof_v3_verdict_source: str = "follower"  # verify | follower
+    owner_verdict_url: str = TESTNET_OWNER_VERDICT_URL
 
     # Operator-controlled maintenance grace. Intended for coordinated releases
     # where validators should keep measuring but temporarily avoid penalties.
@@ -131,6 +181,7 @@ class NeuronConfig(ChainConfig):
     capacity_audit_hard_proof_misses_for_zero_score: int = 2
     capacity_audit_invalid_proof_misses_for_zero_score: int = 1
     capacity_audit_allow_timing_only_score_gate: bool = True
+    capacity_audit_uid_escalation_enabled: bool = False
     capacity_audit_uid_escalation_min_entries: int = 2
     capacity_audit_uid_escalation_fraction: float = 0.10
     capacity_audit_uid_escalation_max_entries: int = 10
@@ -159,6 +210,8 @@ class NeuronConfig(ChainConfig):
             "canary_proof_sample_rate": "VERATHOS_CANARY_PROOF_SAMPLE_RATE",
             "probation_required_passes": "VERATHOS_PROBATION_PASSES",
             "probation_escalation_epochs": "VERATHOS_PROBATION_ESCALATION",
+            "proof_v3_failure_epochs_for_penalty": "VERATHOS_PROOF_V3_FAILURE_EPOCHS_FOR_PENALTY",
+            "proof_v3_failure_clean_epochs_for_reset": "VERATHOS_PROOF_V3_FAILURE_CLEAN_EPOCHS_FOR_RESET",
             "set_weights_epoch_blocks": "VERATHOS_SET_WEIGHTS_EPOCH",
             "demand_bonus_max": "VERATHOS_DEMAND_BONUS_MAX",
             "demand_bonus_enabled": "VERATHOS_DEMAND_BONUS_ENABLED",
@@ -179,6 +232,10 @@ class NeuronConfig(ChainConfig):
             "subnet_config_timeout_seconds": "VERATHOS_SUBNET_CONFIG_TIMEOUT_SECONDS",
             "subnet_config_cache_path": "VERATHOS_SUBNET_CONFIG_CACHE_PATH",
             "subnet_config_disable": "VERATHOS_SUBNET_CONFIG_DISABLE",
+            "proof_protocol_allowed_versions": "VERATHOS_PROOF_PROTOCOL_ALLOWED_VERSIONS",
+            "proof_v3_hard_failure_url": "VERATHOS_PROOF_V3_HARD_FAILURE_URL",
+            "proof_v3_verdict_source": "VERATHOS_PROOF_V3_VERDICT_SOURCE",
+            "owner_verdict_url": "VERATHOS_OWNER_VERDICT_URL",
             "maintenance_grace_enabled": "VERATHOS_MAINTENANCE_GRACE_ENABLED",
             "maintenance_grace_open_ended": "VERATHOS_MAINTENANCE_GRACE_OPEN_ENDED",
             "maintenance_grace_until_epoch": "VERATHOS_MAINTENANCE_GRACE_UNTIL_EPOCH",
@@ -220,6 +277,7 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_hard_proof_misses_for_zero_score": "VERATHOS_CAPACITY_AUDIT_HARD_PROOF_MISSES_FOR_ZERO_SCORE",
             "capacity_audit_invalid_proof_misses_for_zero_score": "VERATHOS_CAPACITY_AUDIT_INVALID_PROOF_MISSES_FOR_ZERO_SCORE",
             "capacity_audit_allow_timing_only_score_gate": "VERATHOS_CAPACITY_AUDIT_ALLOW_TIMING_ONLY_SCORE_GATE",
+            "capacity_audit_uid_escalation_enabled": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_ENABLED",
             "capacity_audit_uid_escalation_min_entries": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_MIN_ENTRIES",
             "capacity_audit_uid_escalation_fraction": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_FRACTION",
             "capacity_audit_uid_escalation_max_entries": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_MAX_ENTRIES",
@@ -248,6 +306,8 @@ class NeuronConfig(ChainConfig):
             "canary_full_context_count", "set_weights_epoch_blocks",
             "price_feed_cache_ttl",
             "probation_required_passes", "probation_escalation_epochs",
+            "proof_v3_failure_epochs_for_penalty",
+            "proof_v3_failure_clean_epochs_for_reset",
             "capacity_audit_ingest_port", "capacity_audit_cohort_min",
             "capacity_audit_cohort_max", "capacity_audit_windows_per_epoch",
             "capacity_audit_group_stress_min_size",
@@ -292,8 +352,28 @@ class NeuronConfig(ChainConfig):
                     kwargs[attr] = int(val)
                 elif attr in _bool_fields:
                     kwargs[attr] = val.lower() in ("1", "true", "yes")
+                elif attr == "proof_protocol_allowed_versions":
+                    kwargs[attr] = tuple(
+                        int(part.strip())
+                        for part in val.split(",")
+                        if part.strip()
+                    )
                 else:
                     kwargs[attr] = val
 
         kwargs.update(overrides)
+        if (
+            "VERATHOS_SUBNET_CONFIG_URL" not in os.environ
+            and "subnet_config_url" not in overrides
+        ):
+            kwargs["subnet_config_url"] = default_subnet_config_url(
+                str(kwargs.get("subtensor_network", "test"))
+            )
+        if (
+            "VERATHOS_OWNER_VERDICT_URL" not in os.environ
+            and "owner_verdict_url" not in overrides
+        ):
+            kwargs["owner_verdict_url"] = default_owner_verdict_url(
+                str(kwargs.get("subtensor_network", "test"))
+            )
         return cls(**kwargs)
